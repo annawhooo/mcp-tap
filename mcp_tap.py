@@ -42,13 +42,132 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform exclusive file lock (sidecar .lock file)
+# ---------------------------------------------------------------------------
+#
+# Two mcp-tap instances writing to the same log file would silently
+# corrupt the HMAC chain: each writer computes prev_hmac from its own
+# last entry, so interleaved lines produce a chain that BIO-001 will
+# flag as "tampered" even though the real cause is concurrency. The
+# fix is to refuse to start if another process already holds the log.
+#
+# We use a sidecar <logfile>.lock rather than locking bytes in the
+# log itself, which avoids edge cases with locking byte-ranges of an
+# empty file (particularly on Windows msvcrt.locking).
+
+if os.name == "nt":
+    import msvcrt
+
+    def _try_exclusive_lock(fileobj) -> bool:
+        # msvcrt.locking locks a byte range at the current file offset.
+        # Ensure there's a byte at offset 0 to lock; seek there; lock it.
+        # Any OSError/PermissionError along the way (including another
+        # process already holding the range) means "couldn't acquire".
+        try:
+            fileobj.seek(0, 2)  # end
+            if fileobj.tell() == 0:
+                fileobj.write(b"\0")
+                fileobj.flush()
+            fileobj.seek(0)
+            msvcrt.locking(fileobj.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _release_lock(fileobj) -> None:
+        try:
+            fileobj.seek(0)
+            msvcrt.locking(fileobj.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _try_exclusive_lock(fileobj) -> bool:
+        try:
+            fcntl.flock(fileobj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _release_lock(fileobj) -> None:
+        try:
+            fcntl.flock(fileobj.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+def _acquire_log_lock(log_path: Path):
+    """
+    Acquire an exclusive sidecar lock for `log_path`.
+
+    Returns the open lock file handle on success. Exits with code 1 if
+    another process holds the lock — concurrent writers would corrupt
+    the HMAC chain.
+    """
+    lock_path = log_path.with_name(log_path.name + ".lock")
+    # Open with "ab+" (append-binary, read/write, no truncate). Truncation
+    # via "wb" could race with another process's pending lock on byte 0
+    # and surface as a PermissionError on close.
+    try:
+        lock_file = open(lock_path, "ab+")
+    except OSError as e:
+        print(f"mcp-tap: cannot open lock file {lock_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not _try_exclusive_lock(lock_file):
+        # Best-effort close; if another process holds the lock, close may
+        # still succeed even though we never acquired the range.
+        try:
+            lock_file.close()
+        except OSError:
+            pass
+        print(
+            f"mcp-tap: another process is already writing to {log_path} "
+            f"(lock held on {lock_path}). Concurrent writers would corrupt "
+            f"the HMAC chain. Refusing to start.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return lock_file
 
 
 # ---------------------------------------------------------------------------
 # HMAC Chain (reuses coffer-mcp pattern)
 # ---------------------------------------------------------------------------
+
+HMAC_KEY_BYTES = 32  # 256 bits, matches SHA-256 block size
+
+
+def _load_key_file(key_path: Path) -> bytes:
+    """Read and validate a hex-encoded key file. Raises SystemExit on invalid content."""
+    raw = key_path.read_text().strip()
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError:
+        print(
+            f"mcp-tap: key file {key_path} does not contain valid hex. "
+            f"Delete it to regenerate, or restore a valid key.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if len(key) < 16:
+        print(
+            f"mcp-tap: key file {key_path} holds a {len(key)}-byte key, "
+            f"which is too short. Delete it to regenerate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return key
+
 
 def get_hmac_key() -> bytes:
     """
@@ -56,22 +175,50 @@ def get_hmac_key() -> bytes:
 
     Priority:
       1. MCP_TAP_HMAC_KEY environment variable (hex-encoded)
-      2. .mcp-tap-key file in the log directory
-      3. Generate a new key and write it to .mcp-tap-key
+      2. ~/.mcp-tap-key file (hex-encoded, 600 on POSIX)
+      3. Generate a new key and persist it to ~/.mcp-tap-key
 
     For production: replace with OS keyring or external secret store.
     """
     env_key = os.environ.get("MCP_TAP_HMAC_KEY")
     if env_key:
-        return bytes.fromhex(env_key)
+        try:
+            key = bytes.fromhex(env_key.strip())
+        except ValueError:
+            print(
+                "mcp-tap: MCP_TAP_HMAC_KEY is not valid hex.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if len(key) < 16:
+            print(
+                f"mcp-tap: MCP_TAP_HMAC_KEY is only {len(key)} bytes "
+                f"(need >= 16).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return key
 
     key_path = Path.home() / ".mcp-tap-key"
     if key_path.exists():
-        return bytes.fromhex(key_path.read_text().strip())
+        # Best-effort warning if the key file is readable by others on POSIX.
+        if os.name != "nt":
+            try:
+                mode = key_path.stat().st_mode & 0o777
+                if mode & 0o077:
+                    print(
+                        f"mcp-tap: warning: {key_path} has permissive mode "
+                        f"{oct(mode)}; tightening to 0600.",
+                        file=sys.stderr,
+                    )
+                    key_path.chmod(0o600)
+            except OSError:
+                pass
+        return _load_key_file(key_path)
 
-    new_key = os.urandom(32)
+    new_key = os.urandom(HMAC_KEY_BYTES)
     key_path.write_text(new_key.hex())
-    # Restrict permissions on Unix; best-effort on Windows
+    # Restrict permissions on Unix; best-effort on Windows.
     try:
         key_path.chmod(0o600)
     except OSError:
@@ -87,58 +234,78 @@ def compute_hmac(data: str, key: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Sensitive Data Handling
 # ---------------------------------------------------------------------------
+#
+# All modes operate structurally on the parsed params tree — never by
+# serializing to JSON and regex-replacing. Serialize-then-regex can
+# destroy JSON punctuation (e.g. greedy \S+ eating `","next":"value`)
+# and leave the mode unable to round-trip through json.loads.
 
-# Common secret patterns (Bearer tokens, API keys, passwords)
-SECRET_PATTERNS = [
-    (re.compile(r"(Bearer\s+)\S+", re.IGNORECASE), r"\1[REDACTED]"),
-    (re.compile(r"(sk-[a-zA-Z0-9_-])[a-zA-Z0-9_-]{20,}"), r"\1...[REDACTED]"),
-    (re.compile(r"(key[\"']?\s*[:=]\s*[\"']?)[a-zA-Z0-9_-]{16,}", re.IGNORECASE), r"\1[REDACTED]"),
-    (re.compile(r"(password[\"']?\s*[:=]\s*[\"']?)\S+", re.IGNORECASE), r"\1[REDACTED]"),
-    (re.compile(r"(token[\"']?\s*[:=]\s*[\"']?)[a-zA-Z0-9_-]{16,}", re.IGNORECASE), r"\1[REDACTED]"),
+# Keys whose *value* should always be replaced wholesale, regardless
+# of the value's content. Matched case-insensitively against the key name.
+SENSITIVE_KEY_RE = re.compile(
+    r"(password|passwd|secret|token|api[_-]?key|auth|credential|bearer)",
+    re.IGNORECASE,
+)
+
+# Patterns applied to string *values* whose key didn't match above.
+# Replacements include the literal [REDACTED] marker so downstream
+# readers can distinguish redacted from original content.
+VALUE_PATTERNS = [
+    (re.compile(r"Bearer\s+\S+", re.IGNORECASE), "Bearer [REDACTED]"),
+    (re.compile(r"sk-[a-zA-Z0-9_-]{20,}"), "[REDACTED]"),
+    (re.compile(r"ghp_[a-zA-Z0-9]{30,}"), "[REDACTED]"),  # GitHub PATs
+    (re.compile(r"xox[baprs]-[a-zA-Z0-9-]{10,}"), "[REDACTED]"),  # Slack tokens
 ]
 
 
-def redact_secrets(text: str) -> str:
-    """Replace common secret patterns with [REDACTED]."""
-    for pattern, replacement in SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+def _hash_str(s: str) -> str:
+    return f"sha256:{hashlib.sha256(s.encode('utf-8')).hexdigest()[:16]}"
 
 
-def hash_params(params: dict) -> dict:
-    """Replace all string values with SHA-256 hashes."""
-    if params is None:
-        return None
-    result = {}
-    for k, v in params.items():
-        if isinstance(v, str):
-            result[k] = f"sha256:{hashlib.sha256(v.encode()).hexdigest()[:16]}"
-        elif isinstance(v, dict):
-            result[k] = hash_params(v)
-        elif isinstance(v, list):
-            result[k] = [
-                hash_params(i) if isinstance(i, dict)
-                else f"sha256:{hashlib.sha256(str(i).encode()).hexdigest()[:16]}"
-                if isinstance(i, str) else i
-                for i in v
-            ]
-        else:
-            result[k] = v
-    return result
+def _redact_str(s: str) -> str:
+    for pattern, replacement in VALUE_PATTERNS:
+        s = pattern.sub(replacement, s)
+    return s
+
+
+def _walk(obj, string_fn, key=None):
+    """
+    Walk a JSON-like tree, applying string_fn(value, key) to every string.
+    Recurses into dicts and lists. Non-string scalars pass through unchanged.
+    """
+    if isinstance(obj, dict):
+        return {k: _walk(v, string_fn, key=k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        # List elements inherit the parent key (e.g. params["tokens"][i])
+        return [_walk(v, string_fn, key=key) for v in obj]
+    if isinstance(obj, str):
+        return string_fn(obj, key)
+    return obj
+
+
+def _redact_value(s: str, key) -> str:
+    if key and SENSITIVE_KEY_RE.search(str(key)):
+        return "[REDACTED]"
+    return _redact_str(s)
+
+
+def _hash_value(s: str, key) -> str:
+    return _hash_str(s)
 
 
 def process_params(params, mode: str):
     """Process params according to the configured sensitivity mode."""
-    if params is None:
-        return None
-    if mode == "full":
+    if params is None or mode == "full":
         return params
-    elif mode == "redact":
-        return json.loads(redact_secrets(json.dumps(params)))
-    elif mode == "hash":
-        return hash_params(params) if isinstance(params, dict) else params
-    elif mode == "metadata":
-        return {"_redacted": True, "_keys": list(params.keys()) if isinstance(params, dict) else None}
+    if mode == "metadata":
+        return {
+            "_redacted": True,
+            "_keys": list(params.keys()) if isinstance(params, dict) else None,
+        }
+    if mode == "redact":
+        return _walk(params, _redact_value)
+    if mode == "hash":
+        return _walk(params, _hash_value)
     return params
 
 
@@ -146,31 +313,49 @@ def process_params(params, mode: str):
 # JSON-RPC Message Parsing
 # ---------------------------------------------------------------------------
 
-def classify_message(msg: dict) -> tuple[str, str | None, dict | None, str | None]:
+@dataclass(frozen=True)
+class ClassifiedMessage:
     """
-    Classify a JSON-RPC message.
+    Structured result of classifying a JSON-RPC message.
 
-    Returns: (message_type, method, params, message_id)
+    Fields:
+      message_type: "request" | "notification" | "response" | "unknown"
+      method:       JSON-RPC method name (None for responses)
+      params:       For requests/notifications, the params object.
+                    For responses, either the result or the error object.
+      message_id:   JSON-RPC id (None for notifications / unknown).
+      is_error:     True iff this is a response carrying an error object
+                    (i.e. the message had an "error" key, not "result").
+                    Lets downstream rules distinguish success from error
+                    responses without substring-searching params.
     """
+    message_type: str
+    method: Optional[str]
+    params: Any
+    message_id: Any
+    is_error: bool = False
+
+
+def classify_message(msg: dict) -> ClassifiedMessage:
+    """Classify a JSON-RPC message."""
     msg_id = msg.get("id")
 
     if "method" in msg:
         method = msg["method"]
         params = msg.get("params")
         if msg_id is not None:
-            return ("request", method, params, msg_id)
-        else:
-            return ("notification", method, params, None)
-    elif "result" in msg or "error" in msg:
+            return ClassifiedMessage("request", method, params, msg_id)
+        return ClassifiedMessage("notification", method, params, None)
+
+    if "result" in msg or "error" in msg:
         # Check key existence, not truthiness. A response with
         # result=null or result=0 is valid and must not be treated
         # as an error just because the value is falsy.
         if "result" in msg:
-            return ("response", None, msg.get("result"), msg_id)
-        else:
-            return ("response", None, msg.get("error"), msg_id)
-    else:
-        return ("unknown", None, None, msg_id)
+            return ClassifiedMessage("response", None, msg.get("result"), msg_id, is_error=False)
+        return ClassifiedMessage("response", None, msg.get("error"), msg_id, is_error=True)
+
+    return ClassifiedMessage("unknown", None, None, msg_id)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +364,12 @@ def classify_message(msg: dict) -> tuple[str, str | None, dict | None, str | Non
 
 class AuditLogger:
     """Tamper-evident JSONL audit logger with HMAC chain."""
+
+    # Cap on in-flight request tracking. If a server never responds to a
+    # request, its entry would otherwise live forever. Evict the oldest
+    # when the cap is hit; latency for those responses will be logged as
+    # None, which is strictly better than growing memory unbounded.
+    MAX_PENDING_REQUESTS = 10_000
 
     def __init__(self, log_path: str, server_id: str, sensitivity: str,
                  hmac_key: bytes, session_id: str = None):
@@ -190,10 +381,16 @@ class AuditLogger:
         self.sequence = 0
         self.prev_hmac = "genesis"
         self.lock = threading.Lock()
-        self.pending_requests: dict[str, float] = {}  # message_id -> timestamp
+        # OrderedDict so we can cheaply evict the oldest entry when the
+        # cap is hit. popitem(last=False) is FIFO eviction.
+        self.pending_requests: "OrderedDict[str, float]" = OrderedDict()
 
         # Ensure log directory exists
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Acquire an exclusive lock BEFORE opening the log for append.
+        # Exits if another mcp-tap is already writing this file.
+        self._lock_file = _acquire_log_lock(self.log_path)
 
         # Open persistent file handle (avoids per-write open/close overhead)
         self._log_file = open(self.log_path, "a", encoding="utf-8")
@@ -212,10 +409,14 @@ class AuditLogger:
         })
 
     def close(self):
-        """Close the log file handle."""
+        """Close the log file handle and release the sidecar lock."""
         if self._log_file and not self._log_file.closed:
             self._log_file.flush()
             self._log_file.close()
+        lock_file = getattr(self, "_lock_file", None)
+        if lock_file is not None and not lock_file.closed:
+            _release_lock(lock_file)
+            lock_file.close()
 
     def log_message(self, direction: str, raw_line: str):
         """Parse a JSON-RPC message and write an audit entry."""
@@ -226,18 +427,23 @@ class AuditLogger:
             self._write_raw(direction, raw_line)
             return
 
-        msg_type, method, params, msg_id = classify_message(msg)
+        cm = classify_message(msg)
         now = time.time()
         now_iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
 
         # Latency tracking
         latency_ms = None
-        if msg_type == "request" and msg_id is not None:
+        if cm.message_type == "request" and cm.message_id is not None:
             with self.lock:
-                self.pending_requests[str(msg_id)] = now
-        elif msg_type == "response" and msg_id is not None:
+                self.pending_requests[str(cm.message_id)] = now
+                # Bound the in-flight table. If a server drops responses
+                # the table would otherwise grow without limit; evict FIFO
+                # on overflow. Latency for evicted requests will be None.
+                while len(self.pending_requests) > self.MAX_PENDING_REQUESTS:
+                    self.pending_requests.popitem(last=False)
+        elif cm.message_type == "response" and cm.message_id is not None:
             with self.lock:
-                req_time = self.pending_requests.pop(str(msg_id), None)
+                req_time = self.pending_requests.pop(str(cm.message_id), None)
             if req_time is not None:
                 latency_ms = round((now - req_time) * 1000, 2)
 
@@ -247,10 +453,11 @@ class AuditLogger:
             "session_id": self.session_id,
             "server_id": self.server_id,
             "direction": direction,
-            "method": method,
-            "params": process_params(params, self.sensitivity),
-            "message_id": str(msg_id) if msg_id is not None else None,
-            "message_type": msg_type,
+            "method": cm.method,
+            "params": process_params(cm.params, self.sensitivity),
+            "message_id": str(cm.message_id) if cm.message_id is not None else None,
+            "message_type": cm.message_type,
+            "is_error": cm.is_error if cm.message_type == "response" else None,
             "latency_ms": latency_ms,
             "hmac": "",       # filled by _write_entry
             "prev_hmac": "",  # filled by _write_entry
@@ -261,6 +468,12 @@ class AuditLogger:
     def _write_entry(self, entry: dict):
         """Write a single JSONL entry with HMAC chain."""
         with self.lock:
+            # Defensive: if close() has already run, silently drop. The
+            # alternative is a ValueError from writing to a closed file,
+            # which would propagate up through a relay thread.
+            if self._log_file is None or self._log_file.closed:
+                return
+
             self.sequence += 1
             entry["sequence"] = self.sequence
             entry["prev_hmac"] = self.prev_hmac
@@ -503,24 +716,35 @@ def main():
 
     # Extract the server's working directory from the command
     # (heuristic: last argument that looks like a path)
+    # Uses Path.is_relative_to (Py 3.9+) rather than string-prefix matching,
+    # which would match `/foo/barbaz` against `/foo/bar`.
     server_parts = args.server.split()
     for part in reversed(server_parts):
-        candidate = Path(part)
         try:
-            resolved = candidate.resolve()
-            if resolved.is_dir():
-                if str(log_path).startswith(str(resolved)):
-                    print(
-                        f"mcp-tap: REFUSING to start. Log path ({log_path}) "
-                        f"is inside the server's directory ({resolved}). "
-                        f"An agent with filesystem access could tamper with the log. "
-                        f"Use a log path OUTSIDE the server's scope.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-                break
+            resolved = Path(part).resolve()
         except (OSError, ValueError):
             continue
+        if not resolved.is_dir():
+            continue
+        try:
+            contained = log_path.is_relative_to(resolved)
+        except AttributeError:
+            # Py 3.8 fallback (is_relative_to added in 3.9).
+            try:
+                log_path.relative_to(resolved)
+                contained = True
+            except ValueError:
+                contained = False
+        if contained:
+            print(
+                f"mcp-tap: REFUSING to start. Log path ({log_path}) "
+                f"is inside the server's directory ({resolved}). "
+                f"An agent with filesystem access could tamper with the log. "
+                f"Use a log path OUTSIDE the server's scope.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        break
 
     # Initialize HMAC key
     hmac_key = get_hmac_key()
@@ -544,6 +768,10 @@ def main():
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # On Windows, commands like npx/node are .cmd wrappers that
+            # require shell=True to resolve. The command comes from the
+            # user's own --server argument, so no injection risk.
+            shell=(os.name == "nt"),
         )
     except FileNotFoundError as e:
         logger.log_lifecycle("server_start_failed", {"error": str(e)})
@@ -611,14 +839,18 @@ def main():
 
     shutdown.set()
 
-    # Log final state
+    # Drain relay threads BEFORE closing the log. Otherwise a thread
+    # still holding a JSON line mid-parse would write to a closed file.
+    # The c2s thread may be blocked in sys.stdin.readline(); it's a
+    # daemon, so we bound the join and move on if it won't exit.
+    c2s.join(timeout=2)
+    s2c.join(timeout=2)
+
+    # Now that no more log_message calls are in flight, it's safe to
+    # write the final lifecycle entry and close the file.
     exit_code = proc.returncode
     logger.log_lifecycle("server_stopped", {"exit_code": exit_code})
     logger.close()
-
-    # Wait briefly for relay threads to drain
-    c2s.join(timeout=2)
-    s2c.join(timeout=2)
 
     sys.exit(exit_code if exit_code is not None else 0)
 

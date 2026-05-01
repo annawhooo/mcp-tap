@@ -27,9 +27,7 @@ from mcp_tap import (
     AuditLogger,
     classify_message,
     compute_hmac,
-    hash_params,
     process_params,
-    redact_secrets,
 )
 from mcp_detect import (
     Finding,
@@ -61,56 +59,62 @@ class TestClassifyMessage(unittest.TestCase):
     def test_request(self):
         msg = {"jsonrpc": "2.0", "method": "tools/call",
                "params": {"name": "read_file"}, "id": 1}
-        msg_type, method, params, msg_id = classify_message(msg)
-        self.assertEqual(msg_type, "request")
-        self.assertEqual(method, "tools/call")
-        self.assertEqual(msg_id, 1)
+        result = classify_message(msg)
+        self.assertEqual(result.message_type, "request")
+        self.assertEqual(result.method, "tools/call")
+        self.assertEqual(result.message_id, 1)
 
     def test_notification(self):
         msg = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        msg_type, method, params, msg_id = classify_message(msg)
-        self.assertEqual(msg_type, "notification")
-        self.assertIsNone(msg_id)
+        result = classify_message(msg)
+        self.assertEqual(result.message_type, "notification")
+        self.assertIsNone(result.message_id)
 
     def test_response_with_result(self):
         msg = {"jsonrpc": "2.0", "result": {"tools": []}, "id": 1}
-        msg_type, method, params, msg_id = classify_message(msg)
-        self.assertEqual(msg_type, "response")
-        self.assertEqual(params, {"tools": []})
+        result = classify_message(msg)
+        self.assertEqual(result.message_type, "response")
+        self.assertEqual(result.params, {"tools": []})
+        self.assertFalse(result.is_error)
 
     def test_response_with_error(self):
         msg = {"jsonrpc": "2.0", "error": {"code": -1, "message": "fail"}, "id": 2}
-        msg_type, method, params, msg_id = classify_message(msg)
-        self.assertEqual(msg_type, "response")
-        self.assertEqual(params, {"code": -1, "message": "fail"})
+        result = classify_message(msg)
+        self.assertEqual(result.message_type, "response")
+        self.assertEqual(result.params, {"code": -1, "message": "fail"})
+        self.assertTrue(result.is_error)
 
     def test_response_null_result_not_treated_as_error(self):
         """The falsy fix: result=null is a valid success response."""
         msg = {"jsonrpc": "2.0", "result": None, "id": 1}
-        msg_type, method, params, msg_id = classify_message(msg)
-        self.assertEqual(msg_type, "response")
-        self.assertIsNone(params)  # result is None, not error
+        result = classify_message(msg)
+        self.assertEqual(result.message_type, "response")
+        self.assertIsNone(result.params)  # result is None, not error
+        self.assertFalse(result.is_error)
 
     def test_response_zero_result_not_treated_as_error(self):
         msg = {"jsonrpc": "2.0", "result": 0, "id": 1}
-        _, _, params, _ = classify_message(msg)
-        self.assertEqual(params, 0)
+        result = classify_message(msg)
+        self.assertEqual(result.params, 0)
+        self.assertFalse(result.is_error)
 
     def test_response_empty_string_result(self):
         msg = {"jsonrpc": "2.0", "result": "", "id": 1}
-        _, _, params, _ = classify_message(msg)
-        self.assertEqual(params, "")
+        result = classify_message(msg)
+        self.assertEqual(result.params, "")
+        self.assertFalse(result.is_error)
 
     def test_response_result_takes_precedence(self):
         """If both result and error present, result wins."""
         msg = {"jsonrpc": "2.0", "result": "ok", "error": {"code": -1}, "id": 1}
-        _, _, params, _ = classify_message(msg)
-        self.assertEqual(params, "ok")
+        result = classify_message(msg)
+        self.assertEqual(result.params, "ok")
+        self.assertFalse(result.is_error)
 
     def test_unknown_message(self):
         msg = {"jsonrpc": "2.0", "id": 1}
-        msg_type, _, _, _ = classify_message(msg)
-        self.assertEqual(msg_type, "unknown")
+        result = classify_message(msg)
+        self.assertEqual(result.message_type, "unknown")
 
 
 # ===================================================================
@@ -120,15 +124,15 @@ class TestClassifyMessage(unittest.TestCase):
 class TestSensitiveData(unittest.TestCase):
 
     def test_redact_bearer_token(self):
-        text = '{"Authorization": "Bearer sk-abc123def456ghi789"}'
-        result = redact_secrets(text)
-        self.assertNotIn("sk-abc123def456ghi789", result)
-        self.assertIn("[REDACTED]", result)
+        params = {"header": "Bearer sk-abc123def456ghi789"}
+        result = process_params(params, "redact")
+        self.assertNotIn("sk-abc123def456ghi789", str(result))
+        self.assertIn("[REDACTED]", str(result))
 
     def test_redact_sk_key(self):
-        text = 'token: sk-abcdefghijklmnopqrstuvwxyz'
-        result = redact_secrets(text)
-        self.assertIn("[REDACTED]", result)
+        params = {"token_value": "sk-abcdefghijklmnopqrstuvwxyz"}
+        result = process_params(params, "redact")
+        self.assertIn("[REDACTED]", str(result))
 
     def test_full_mode_preserves_all(self):
         params = {"token": "secret123", "path": "/data"}

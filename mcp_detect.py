@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -91,31 +92,42 @@ class Finding:
 #   CONV-005: MITRE ATT&CK T1087 Account Discovery, T1083 File and
 #             Directory Discovery. Standard SIEM enumeration detection.
 
+def _is_jsonrpc_error_response(m: dict) -> bool:
+    """
+    True iff m is a JSON-RPC error response.
+
+    Prefer mcp-tap's explicit `is_error` field (set by classify_message).
+    Fall back to a structural shape check (JSON-RPC 2.0 error objects are
+    required to have an integer `code` and a string `message`, spec §5.1)
+    for older logs and for logs produced by adapters that don't emit the
+    field. Either path avoids false positives on successful responses
+    whose result merely contains the word "error".
+    """
+    if m.get("message_type") != "response":
+        return False
+    if m.get("is_error") is True:
+        return True
+    if m.get("is_error") is False:
+        return False
+    # Field absent — fall back to shape inspection.
+    p = m.get("params")
+    if not isinstance(p, dict):
+        return False
+    return isinstance(p.get("code"), int) and isinstance(p.get("message"), str)
+
+
 def conv_001_failed_auth(messages: list[dict]) -> list[Finding]:
     """CONV-001: Failed authentication/operation attempts."""
-    findings = []
-    seen_sequences = set()
-    all_failures = []
-
-    for m in messages:
-        seq = m.get("sequence")
-        if seq in seen_sequences:
-            continue
-        if m.get("message_type") == "response" and isinstance(m.get("params"), dict):
-            params_str = str(m.get("params", {})).lower()
-            if "error" in params_str or m["params"].get("code"):
-                all_failures.append(m)
-                seen_sequences.add(seq)
-
-    if len(all_failures) >= 3:
-        findings.append(Finding(
-            rule_id="CONV-001",
-            rule_set="conventional",
-            severity="MEDIUM",
-            description=f"Multiple failed operations detected: {len(all_failures)} error responses",
-            evidence=all_failures[:10],
-        ))
-    return findings
+    failures = [m for m in messages if _is_jsonrpc_error_response(m)]
+    if len(failures) < 3:
+        return []
+    return [Finding(
+        rule_id="CONV-001",
+        rule_set="conventional",
+        severity="MEDIUM",
+        description=f"Multiple failed operations detected: {len(failures)} error responses",
+        evidence=failures[:10],
+    )]
 
 
 def conv_002_volume_spike(messages: list[dict]) -> list[Finding]:
@@ -266,7 +278,25 @@ def bio_001_hmac_chain_integrity(entries: list[dict]) -> list[Finding]:
     return findings
 
 
-def bio_002_telemetry_gap(messages: list[dict]) -> list[Finding]:
+def _parse_ts(ts: str):
+    """Parse an ISO 8601 timestamp, tolerating trailing 'Z'. Returns None on failure."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+# Tail window: requests in the last N seconds of the log are excluded
+# from orphan detection, since their responses may simply not have
+# arrived before the log was read. This matches operational reality:
+# a log snapshot always truncates mid-conversation.
+BIO_002_TAIL_SECONDS = 5.0
+
+
+def bio_002_telemetry_gap(messages: list[dict],
+                          tail_seconds: float = BIO_002_TAIL_SECONDS) -> list[Finding]:
     """
     BIO-002: Telemetry gap detection (missing-self signal).
     Principle: #2 (Infrastructure-sampled evidence). Scenario: #1.
@@ -274,10 +304,34 @@ def bio_002_telemetry_gap(messages: list[dict]) -> list[Finding]:
     If there are requests without matching responses (or vice versa),
     something is being suppressed or dropped. The ABSENCE of expected
     messages is the signal (NK cell missing-self model).
+
+    Requests within `tail_seconds` of the last observed message are
+    excluded — their responses may simply not have been captured yet
+    when the log was read. Without this, every truncated log would
+    false-positive.
     """
     findings = []
+
+    # Find the last timestamp in the log. Requests arriving within
+    # tail_seconds of it are treated as "still in flight".
+    last_ts = None
+    for m in messages:
+        t = _parse_ts(m.get("timestamp", ""))
+        if t is not None and (last_ts is None or t > last_ts):
+            last_ts = t
+
+    def in_tail(m: dict) -> bool:
+        if last_ts is None:
+            return False
+        t = _parse_ts(m.get("timestamp", ""))
+        if t is None:
+            return False
+        return (last_ts - t).total_seconds() < tail_seconds
+
     requests = {str(m.get("message_id")): m for m in messages
-                if m.get("message_type") == "request" and m.get("message_id")}
+                if m.get("message_type") == "request"
+                and m.get("message_id")
+                and not in_tail(m)}
     responses = {str(m.get("message_id")): m for m in messages
                  if m.get("message_type") == "response" and m.get("message_id")}
 
@@ -367,6 +421,22 @@ def bio_003_behavioral_baseline_deviation(messages: list[dict],
     return findings
 
 
+def _honeytoken_regex(token: str) -> "re.Pattern":
+    """
+    Build a match pattern for a honeytoken that anchors on non-word
+    boundaries. A substring check would match 'admin.txt' inside
+    'sysadmin.txt_notes'; anchoring requires that the character before
+    and after (if any) is not a word/path continuation character, so
+    the token must appear as a standalone path component or filename.
+    """
+    # Allowed "adjacent" characters: anything that isn't alphanumeric,
+    # underscore, hyphen, or dot. Path separators (/, \) and quotes,
+    # braces, spaces all qualify as boundaries.
+    boundary = r"(?:^|[^A-Za-z0-9_.\-])"
+    end = r"(?:[^A-Za-z0-9_.\-]|$)"
+    return re.compile(boundary + re.escape(token) + end, re.IGNORECASE)
+
+
 def bio_004_honeytokens(messages: list[dict], honeytokens: list[str] = None) -> list[Finding]:
     """
     BIO-004: Honeytoken access detection.
@@ -374,6 +444,10 @@ def bio_004_honeytokens(messages: list[dict], honeytokens: list[str] = None) -> 
 
     Any access to a file/resource on the honeytoken list is an alarm.
     No legitimate workflow should ever touch these resources.
+
+    Matching is boundary-anchored (not substring) so that a honeytoken
+    named 'admin.txt' does not trigger on unrelated names like
+    'sysadmin.txt_notes'.
 
     IMPORTANT: The default honeytoken list below is for TESTING ONLY.
     For real deployments, provide a custom list via --honeytokens CLI
@@ -384,12 +458,15 @@ def bio_004_honeytokens(messages: list[dict], honeytokens: list[str] = None) -> 
         # Default list for testing. Override with --honeytokens in production.
         honeytokens = DEFAULT_HONEYTOKENS
 
+    patterns = [(t, _honeytoken_regex(t)) for t in honeytokens]
     findings = []
     for m in messages:
-        params = m.get("params", {})
-        params_str = json.dumps(params).lower() if params else ""
-        for token in honeytokens:
-            if token.lower() in params_str:
+        params = m.get("params")
+        if not params:
+            continue
+        params_str = json.dumps(params)
+        for token, pattern in patterns:
+            if pattern.search(params_str):
                 findings.append(Finding(
                     rule_id="BIO-004",
                     rule_set="bio-derived",
@@ -553,32 +630,60 @@ def bio_009_latency_anomaly(messages: list[dict]) -> list[Finding]:
     If a tool's response latency changes significantly, the tool may have
     been replaced with a different implementation. A shadow tool will have
     different performance characteristics than the original.
+
+    Latencies are grouped by the originating request's method (and, for
+    tools/call, by tool name) so that a shift in *one* tool isn't diluted
+    by unrelated traffic.
     """
     findings = []
-    latencies_by_method = defaultdict(list)
 
-    # Correlate requests with responses for latency
+    # Build a map: message_id -> key describing what was called.
+    # For tools/call we use "tools/call:<tool_name>" so different tools
+    # are tracked independently.
+    key_by_id: dict[str, str] = {}
     for m in messages:
-        if m.get("latency_ms") is not None and m.get("message_id"):
-            latencies_by_method["response"].append(m.get("latency_ms"))
+        if m.get("message_type") != "request" or not m.get("message_id"):
+            continue
+        method = m.get("method") or "unknown"
+        key = method
+        if method == "tools/call":
+            p = m.get("params")
+            if isinstance(p, dict):
+                tool_name = p.get("name")
+                if tool_name:
+                    key = f"tools/call:{tool_name}"
+        key_by_id[str(m["message_id"])] = key
 
-    for method, lats in latencies_by_method.items():
-        if len(lats) >= 4:
-            mid = len(lats) // 2
-            first_avg = sum(lats[:mid]) / mid
-            second_avg = sum(lats[mid:]) / (len(lats) - mid)
+    latencies_by_key: dict[str, list[float]] = defaultdict(list)
+    for m in messages:
+        lat = m.get("latency_ms")
+        if lat is None or not m.get("message_id"):
+            continue
+        key = key_by_id.get(str(m["message_id"]))
+        if key is None:
+            continue
+        latencies_by_key[key].append(lat)
 
-            if first_avg > 0 and abs(second_avg - first_avg) / first_avg > 0.5:
-                findings.append(Finding(
-                    rule_id="BIO-009",
-                    rule_set="bio-derived",
-                    severity="MEDIUM",
-                    description=f"Latency shift detected: first half avg={first_avg:.1f}ms, "
-                                f"second half avg={second_avg:.1f}ms "
-                                f"({abs(second_avg - first_avg) / first_avg * 100:.0f}% change)",
-                    evidence=[],
-                    scenario="#22 Tool Substitution",
-                ))
+    for key, lats in latencies_by_key.items():
+        if len(lats) < 4:
+            continue
+        mid = len(lats) // 2
+        first_avg = sum(lats[:mid]) / mid
+        second_avg = sum(lats[mid:]) / (len(lats) - mid)
+        if first_avg <= 0:
+            continue
+        change = abs(second_avg - first_avg) / first_avg
+        if change > 0.5:
+            findings.append(Finding(
+                rule_id="BIO-009",
+                rule_set="bio-derived",
+                severity="MEDIUM",
+                description=f"Latency shift for {key}: first half avg={first_avg:.1f}ms, "
+                            f"second half avg={second_avg:.1f}ms "
+                            f"({change * 100:.0f}% change, n={len(lats)})",
+                evidence=[],
+                scenario="#22 Tool Substitution",
+            ))
     return findings
 
 

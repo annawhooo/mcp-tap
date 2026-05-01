@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-analyze.py: Statistical analysis for the A/B/C MCP detection experiment.
+analyze.py: Statistical analysis for the 2x2 factorial MCP detection experiment.
 
-Reads a results CSV with columns:
-  scenario, group_a, group_b, group_c
+Design:
+  Group A: No monitoring (control)
+  2x2 factorial:
+    Capture tool (Bifrost HTTP vs mcp-tap stdio)
+    x Rule set (conventional vs bio-derived)
+
+CSV columns:
+  scenario, group_a, b_conv, b_bio, c_conv, c_bio
 
 Where each cell is: DETECTED, OBSERVABLE, or MISSED
 
 Runs:
-  1. Cochran's Q test (omnibus: do the three groups differ?)
-  2. Pairwise McNemar's with Bonferroni correction
-  3. Descriptive three-category breakdown
-  4. Per-scenario comparison table
+  1. Detection rates per cell
+  2. Main effects (rule set effect, capture tool effect)
+  3. Cochran's Q (omnibus: do the four factorial cells differ?)
+  4. Pairwise McNemar's with Bonferroni correction
+  5. Interaction analysis
+  6. Descriptive three-category breakdown
+  7. Complementarity analysis
 
 Usage:
     python analyze.py --results results.csv
-    python analyze.py --example  # generate example CSV and run
+    python analyze.py --example  # generate example data and run
 """
 
 import argparse
@@ -25,6 +34,18 @@ from collections import Counter
 from io import StringIO
 
 
+FACTORIAL_CELLS = ["b_conv", "b_bio", "c_conv", "c_bio"]
+ALL_CELLS = ["group_a"] + FACTORIAL_CELLS
+
+CELL_LABELS = {
+    "group_a": "Group A (none)",
+    "b_conv": "Bifrost+Conv",
+    "b_bio": "Bifrost+Bio",
+    "c_conv": "mcp-tap+Conv",
+    "c_bio": "mcp-tap+Bio",
+}
+
+
 def read_results(path: str) -> list[dict]:
     """Read results CSV."""
     with open(path, "r") as f:
@@ -32,23 +53,22 @@ def read_results(path: str) -> list[dict]:
         return list(reader)
 
 
-def cochrans_q(data: list[dict]) -> dict:
+def _detected(row: dict, col: str) -> int:
+    """Return 1 if DETECTED, 0 otherwise."""
+    return 1 if row[col] == "DETECTED" else 0
+
+
+def cochrans_q(data: list[dict], columns: list[str]) -> dict:
     """
     Cochran's Q test for k related samples with binary outcomes.
-
     Tests H0: the proportion of DETECTED is equal across all groups.
     """
     n = len(data)
-    k = 3  # groups A, B, C
+    k = len(columns)
 
-    # Convert to binary: DETECTED=1, else=0
     binary = []
     for row in data:
-        binary.append([
-            1 if row["group_a"] == "DETECTED" else 0,
-            1 if row["group_b"] == "DETECTED" else 0,
-            1 if row["group_c"] == "DETECTED" else 0,
-        ])
+        binary.append([_detected(row, col) for col in columns])
 
     # Column totals (Tj = total detections per group)
     T = [sum(row[j] for row in binary) for j in range(k)]
@@ -56,7 +76,6 @@ def cochrans_q(data: list[dict]) -> dict:
     # Row totals (Li = total detections per scenario across groups)
     L = [sum(row) for row in binary]
 
-    # Cochran's Q statistic
     T_sum = sum(T)
     T_sq_sum = sum(t**2 for t in T)
     L_sq_sum = sum(l**2 for l in L)
@@ -67,41 +86,35 @@ def cochrans_q(data: list[dict]) -> dict:
 
     if denominator == 0:
         return {"Q": 0, "df": k - 1, "p_approx": 1.0,
-                "note": "All groups identical (denominator=0)"}
+                "note": "All groups identical"}
 
     Q = numerator / denominator
     df = k - 1
 
-    # Approximate p-value using chi-squared distribution
-    # For df=2: p < 0.05 requires Q > 5.99
-    # For df=2: p < 0.01 requires Q > 9.21
-    # Simple lookup for common thresholds
-    if Q > 9.21:
-        p_approx = "< 0.01"
-    elif Q > 5.99:
-        p_approx = "< 0.05"
-    elif Q > 4.61:
-        p_approx = "< 0.10"
-    else:
-        p_approx = "> 0.10"
+    # Chi-squared critical values for common thresholds
+    # df=3: 0.05->7.81, 0.01->11.34
+    # df=4: 0.05->9.49, 0.01->13.28
+    chi2_05 = {1: 3.84, 2: 5.99, 3: 7.81, 4: 9.49}
+    chi2_01 = {1: 6.63, 2: 9.21, 3: 11.34, 4: 13.28}
 
-    return {
-        "Q": round(Q, 3),
-        "df": df,
-        "p_approx": p_approx,
-        "group_detections": {"A": T[0], "B": T[1], "C": T[2]},
-        "n": n,
-    }
+    if Q > chi2_01.get(df, 13.28):
+        p_approx = "< 0.01"
+    elif Q > chi2_05.get(df, 9.49):
+        p_approx = "< 0.05"
+    else:
+        p_approx = "> 0.05"
+
+    detections = {col: T[i] for i, col in enumerate(columns)}
+    return {"Q": round(Q, 3), "df": df, "p_approx": p_approx,
+            "detections": detections, "n": n}
 
 
 def mcnemars_test(data: list[dict], col1: str, col2: str) -> dict:
     """
     McNemar's test for paired binary data.
-
     Compares two groups on the same scenarios.
-    Uses exact test (appropriate for small n).
+    Uses continuity correction (appropriate for small n).
     """
-    # Count discordant pairs
     b = 0  # detected in col2 but not col1
     c = 0  # detected in col1 but not col2
 
@@ -116,20 +129,14 @@ def mcnemars_test(data: list[dict], col1: str, col2: str) -> dict:
     n_discordant = b + c
 
     if n_discordant == 0:
-        return {
-            "comparison": f"{col1} vs {col2}",
-            "b": b, "c": c,
-            "statistic": 0,
-            "p_approx": 1.0,
-            "note": "No discordant pairs",
-        }
+        return {"comparison": f"{CELL_LABELS.get(col1, col1)} vs "
+                              f"{CELL_LABELS.get(col2, col2)}",
+                "b": b, "c": c, "n_discordant": 0,
+                "statistic": 0, "p_approx": 1.0,
+                "note": "No discordant pairs"}
 
-    # McNemar's chi-squared (with continuity correction for small n)
-    statistic = (abs(b - c) - 1)**2 / (b + c) if (b + c) > 0 else 0
+    statistic = (abs(b - c) - 1)**2 / (b + c)
 
-    # Significance thresholds (chi-squared df=1)
-    # p < 0.05 requires stat > 3.84
-    # p < 0.01 requires stat > 6.63
     if statistic > 6.63:
         p_approx = "< 0.01"
     elif statistic > 3.84:
@@ -140,58 +147,115 @@ def mcnemars_test(data: list[dict], col1: str, col2: str) -> dict:
         p_approx = "> 0.10"
 
     return {
-        "comparison": f"{col1} vs {col2}",
-        "b": b,
-        "c": c,
-        "n_discordant": n_discordant,
+        "comparison": f"{CELL_LABELS.get(col1, col1)} vs "
+                      f"{CELL_LABELS.get(col2, col2)}",
+        "b": b, "c": c, "n_discordant": n_discordant,
         "statistic": round(statistic, 3),
         "p_approx": p_approx,
+    }
+
+
+def main_effects(data: list[dict]) -> dict:
+    """
+    Compute main effects and interaction for the 2x2 factorial.
+
+    Rule set effect:  (b_bio + c_bio) vs (b_conv + c_conv)
+    Capture effect:   (c_conv + c_bio) vs (b_conv + b_bio)
+    Interaction:      does bio advantage differ by transport?
+    """
+    n = len(data)
+
+    # Detection counts per cell
+    counts = {col: sum(_detected(row, col) for row in data)
+              for col in FACTORIAL_CELLS}
+
+    # Main effect: rule set (bio vs conventional)
+    bio_total = counts["b_bio"] + counts["c_bio"]
+    conv_total = counts["b_conv"] + counts["c_conv"]
+    rule_effect = (bio_total - conv_total) / (2 * n)
+
+    # Main effect: capture tool (mcp-tap vs Bifrost)
+    tap_total = counts["c_conv"] + counts["c_bio"]
+    bifrost_total = counts["b_conv"] + counts["b_bio"]
+    capture_effect = (tap_total - bifrost_total) / (2 * n)
+
+    # Interaction: bio advantage on mcp-tap vs bio advantage on Bifrost
+    bio_advantage_tap = counts["c_bio"] - counts["c_conv"]
+    bio_advantage_bifrost = counts["b_bio"] - counts["b_conv"]
+    interaction = (bio_advantage_tap - bio_advantage_bifrost) / n
+
+    return {
+        "counts": counts,
+        "rule_effect": round(rule_effect, 3),
+        "capture_effect": round(capture_effect, 3),
+        "interaction": round(interaction, 3),
+        "bio_total": bio_total,
+        "conv_total": conv_total,
+        "tap_total": tap_total,
+        "bifrost_total": bifrost_total,
+        "bio_advantage_tap": bio_advantage_tap,
+        "bio_advantage_bifrost": bio_advantage_bifrost,
     }
 
 
 def descriptive_table(data: list[dict]) -> str:
     """Generate the per-scenario comparison table."""
     lines = []
-    lines.append(f"{'Scenario':<35} {'Group A':<12} {'Group B':<12} {'Group C':<12}")
-    lines.append("-" * 71)
+    header = (f"{'Scenario':<35} {'A (none)':<12} {'B+Conv':<12} "
+              f"{'B+Bio':<12} {'C+Conv':<12} {'C+Bio':<12}")
+    lines.append(header)
+    lines.append("-" * 95)
 
     for row in data:
         lines.append(
             f"{row['scenario']:<35} "
             f"{row['group_a']:<12} "
-            f"{row['group_b']:<12} "
-            f"{row['group_c']:<12}"
+            f"{row['b_conv']:<12} "
+            f"{row['b_bio']:<12} "
+            f"{row['c_conv']:<12} "
+            f"{row['c_bio']:<12}"
         )
 
-    lines.append("-" * 71)
+    lines.append("-" * 95)
 
-    # Summary counts
     for category in ["DETECTED", "OBSERVABLE", "MISSED"]:
-        a = sum(1 for r in data if r["group_a"] == category)
-        b = sum(1 for r in data if r["group_b"] == category)
-        c = sum(1 for r in data if r["group_c"] == category)
-        lines.append(f"{category:<35} {a:<12} {b:<12} {c:<12}")
+        counts = []
+        for col in ALL_CELLS:
+            counts.append(sum(1 for r in data if r[col] == category))
+        lines.append(
+            f"{category:<35} "
+            + "".join(f"{c:<12}" for c in counts)
+        )
 
     return "\n".join(lines)
 
 
 def generate_example_csv() -> str:
-    """Generate plausible example results for testing the analysis."""
-    # Predicted results based on our knowledge of the rule sets
+    """
+    Generate plausible example results for testing the analysis.
+
+    Predictions based on knowledge of rule sets and transport coverage:
+    - Conventional rules catch: failed auth, volume spikes, rapid calls,
+      credential scope, enumeration
+    - Bio rules catch: HMAC tampering, telemetry gaps, behavioral deviation,
+      honeytokens, silence, functional output, tool schema changes, latency
+    - mcp-tap sees stdio-level detail Bifrost may miss
+    - Bifrost sees HTTP-level detail mcp-tap may miss
+    """
     rows = [
-        "scenario,group_a,group_b,group_c",
-        "#1 Telemetry Suppression,MISSED,MISSED,DETECTED",
-        "#2 Behavioral Camouflage,MISSED,MISSED,DETECTED",
-        "#3 Protocol-Level Deception,MISSED,OBSERVABLE,DETECTED",
-        "#6 Privileged Zone Exploitation,MISSED,MISSED,DETECTED",
-        "#7 Pathobiont Transition,MISSED,OBSERVABLE,OBSERVABLE",
-        "#8 The Sleeper,MISSED,MISSED,DETECTED",
-        "#9 Defense Neutralization,MISSED,MISSED,DETECTED",
-        "#12 Identity Rotation,MISSED,DETECTED,DETECTED",
-        "#13 Trusted Boundary Exploitation,MISSED,DETECTED,OBSERVABLE",
-        "#19 Fabricated Authorization,MISSED,MISSED,OBSERVABLE",
-        "#21 Credential Laundering,MISSED,OBSERVABLE,DETECTED",
-        "#22 Tool Substitution,MISSED,MISSED,DETECTED",
+        "scenario,group_a,b_conv,b_bio,c_conv,c_bio",
+        "#1 Telemetry Suppression,MISSED,MISSED,MISSED,MISSED,DETECTED",
+        "#2 Behavioral Camouflage,MISSED,MISSED,OBSERVABLE,MISSED,DETECTED",
+        "#3 Protocol-Level Deception,MISSED,OBSERVABLE,OBSERVABLE,OBSERVABLE,DETECTED",
+        "#6 Privileged Zone Exploitation,MISSED,MISSED,MISSED,MISSED,DETECTED",
+        "#7 Pathobiont Transition,MISSED,OBSERVABLE,OBSERVABLE,OBSERVABLE,OBSERVABLE",
+        "#8 The Sleeper,MISSED,MISSED,MISSED,MISSED,DETECTED",
+        "#9 Defense Neutralization,MISSED,MISSED,MISSED,MISSED,DETECTED",
+        "#12 Identity Rotation,MISSED,DETECTED,DETECTED,DETECTED,DETECTED",
+        "#13 Trusted Boundary,MISSED,DETECTED,DETECTED,DETECTED,OBSERVABLE",
+        "#19 Fabricated Authorization,MISSED,MISSED,OBSERVABLE,MISSED,OBSERVABLE",
+        "#21 Credential Laundering,MISSED,OBSERVABLE,OBSERVABLE,OBSERVABLE,DETECTED",
+        "#22 Tool Substitution,MISSED,MISSED,MISSED,MISSED,DETECTED",
     ]
     return "\n".join(rows)
 
@@ -199,7 +263,7 @@ def generate_example_csv() -> str:
 def main():
     parser = argparse.ArgumentParser(
         prog="analyze",
-        description="Statistical analysis for A/B/C MCP detection experiment.",
+        description="Statistical analysis for 2x2 factorial MCP detection experiment.",
     )
     parser.add_argument("--results", help="Path to results CSV")
     parser.add_argument("--example", action="store_true",
@@ -220,7 +284,7 @@ def main():
         sys.exit(1)
 
     n = len(data)
-    print(f"=== A/B/C EXPERIMENT ANALYSIS (n={n}) ===")
+    print(f"=== 2x2 FACTORIAL EXPERIMENT ANALYSIS (n={n}) ===")
     print()
 
     # 1. Descriptive table
@@ -229,67 +293,104 @@ def main():
     print()
 
     # 2. Detection rates
-    for group in ["group_a", "group_b", "group_c"]:
-        detected = sum(1 for r in data if r[group] == "DETECTED")
-        label = group.replace("group_", "Group ").upper()
-        print(f"{label} detection rate: {detected}/{n} ({detected/n*100:.0f}%)")
+    print("--- Detection Rates ---")
+    for col in ALL_CELLS:
+        detected = sum(1 for r in data if r[col] == "DETECTED")
+        print(f"  {CELL_LABELS[col]:<20}: {detected}/{n} ({detected/n*100:.0f}%)")
     print()
 
-    # 3. Cochran's Q
-    print("--- Cochran's Q Test (omnibus) ---")
-    q_result = cochrans_q(data)
-    print(f"Q = {q_result['Q']}, df = {q_result['df']}, p {q_result['p_approx']}")
-    print(f"Detections per group: A={q_result['group_detections']['A']}, "
-          f"B={q_result['group_detections']['B']}, "
-          f"C={q_result['group_detections']['C']}")
+    # 3. Main effects
+    print("--- Main Effects (2x2 Factorial) ---")
+    effects = main_effects(data)
+    print(f"  Rule set effect (bio - conv):     {effects['rule_effect']:+.3f}")
+    print(f"    Bio detections:  {effects['bio_total']}/{2*n}  "
+          f"Conv detections: {effects['conv_total']}/{2*n}")
+    print(f"  Capture tool effect (tap - bifrost): {effects['capture_effect']:+.3f}")
+    print(f"    mcp-tap detections: {effects['tap_total']}/{2*n}  "
+          f"Bifrost detections: {effects['bifrost_total']}/{2*n}")
+    print(f"  Interaction:                      {effects['interaction']:+.3f}")
+    print(f"    Bio advantage on mcp-tap:  {effects['bio_advantage_tap']:+d}")
+    print(f"    Bio advantage on Bifrost:  {effects['bio_advantage_bifrost']:+d}")
+    if abs(effects['interaction']) > 0:
+        if effects['interaction'] > 0:
+            print("    -> Bio rules gain MORE on mcp-tap than on Bifrost")
+        else:
+            print("    -> Bio rules gain MORE on Bifrost than on mcp-tap")
     print()
 
-    # 4. Pairwise McNemar's with Bonferroni
-    print("--- Pairwise McNemar's (Bonferroni-corrected, alpha=0.05/3=0.017) ---")
-    pairs = [
-        ("group_a", "group_b", "A vs B (sanity check)"),
-        ("group_a", "group_c", "A vs C (expected)"),
-        ("group_b", "group_c", "B vs C (THE CLAIM)"),
+    # 4. Cochran's Q across factorial cells
+    print("--- Cochran's Q Test (omnibus, 4 factorial cells) ---")
+    q_result = cochrans_q(data, FACTORIAL_CELLS)
+    print(f"  Q = {q_result['Q']}, df = {q_result['df']}, "
+          f"p {q_result['p_approx']}")
+    for col in FACTORIAL_CELLS:
+        print(f"    {CELL_LABELS[col]:<20}: {q_result['detections'][col]} detections")
+    print()
+
+    # 5. Pairwise McNemar's — 4 key contrasts
+    # Bonferroni: alpha = 0.05 / 4 = 0.0125
+    print("--- Pairwise McNemar's (Bonferroni alpha=0.05/4=0.0125) ---")
+    contrasts = [
+        ("b_conv", "b_bio",  "Rule effect on Bifrost"),
+        ("c_conv", "c_bio",  "Rule effect on mcp-tap"),
+        ("b_conv", "c_conv", "Capture effect (conv rules)"),
+        ("b_bio",  "c_bio",  "Capture effect (bio rules)"),
     ]
-    for col1, col2, label in pairs:
+    for col1, col2, label in contrasts:
         result = mcnemars_test(data, col1, col2)
-        print(f"{label}:")
-        print(f"  Discordant pairs: b={result['b']} (detected in {col2.split('_')[1].upper()} only), "
-              f"c={result['c']} (detected in {col1.split('_')[1].upper()} only)")
-        print(f"  McNemar's stat = {result.get('statistic', 'N/A')}, p {result['p_approx']}")
-        # Bonferroni: need p < 0.017 for significance
+        d1_name = CELL_LABELS[col1].split("+")[-1] if "+" in CELL_LABELS[col1] else col1
+        d2_name = CELL_LABELS[col2].split("+")[-1] if "+" in CELL_LABELS[col2] else col2
+        print(f"  {label}:")
+        print(f"    Discordant: b={result['b']} (detected in "
+              f"{CELL_LABELS[col2]} only), c={result['c']} (detected in "
+              f"{CELL_LABELS[col1]} only)")
+        print(f"    McNemar's = {result.get('statistic', 'N/A')}, "
+              f"p {result['p_approx']}")
         if result['p_approx'] in ("< 0.01",):
-            print(f"  ** Significant after Bonferroni correction **")
+            print(f"    ** Significant after Bonferroni **")
         elif result['p_approx'] in ("< 0.05",):
-            print(f"  * Significant at 0.05 but NOT after Bonferroni correction *")
+            print(f"    * Marginal (sig at 0.05, not after Bonferroni) *")
         print()
 
-    # 5. Complementarity analysis
-    print("--- Complementarity Analysis ---")
-    both_detect = sum(1 for r in data
-                      if r["group_b"] == "DETECTED" and r["group_c"] == "DETECTED")
-    b_only = sum(1 for r in data
-                 if r["group_b"] == "DETECTED" and r["group_c"] != "DETECTED")
-    c_only = sum(1 for r in data
-                 if r["group_c"] == "DETECTED" and r["group_b"] != "DETECTED")
-    neither = sum(1 for r in data
-                  if r["group_b"] != "DETECTED" and r["group_c"] != "DETECTED")
-    print(f"Both B and C detect:    {both_detect}/{n}")
-    print(f"Only B detects:         {b_only}/{n}")
-    print(f"Only C detects:         {c_only}/{n}")
-    print(f"Neither detects:        {neither}/{n}")
-    print(f"Combined B+C coverage:  {both_detect + b_only + c_only}/{n}")
+    # 6. Control comparison
+    print("--- Control (Group A) vs Best Factorial Cell ---")
+    best_col = max(FACTORIAL_CELLS,
+                   key=lambda c: sum(_detected(r, c) for r in data))
+    best_count = sum(_detected(r, best_col) for r in data)
+    a_count = sum(_detected(r, "group_a") for r in data)
+    print(f"  Group A: {a_count}/{n} detected")
+    print(f"  Best cell ({CELL_LABELS[best_col]}): {best_count}/{n} detected")
+    control_result = mcnemars_test(data, "group_a", best_col)
+    print(f"  McNemar's = {control_result.get('statistic', 'N/A')}, "
+          f"p {control_result['p_approx']}")
     print()
 
-    if c_only > b_only:
-        print(f"Bio-derived rules uniquely detect {c_only} scenarios that "
-              f"conventional rules miss.")
-    if b_only > 0:
-        print(f"Conventional rules uniquely detect {b_only} scenarios that "
-              f"bio-derived rules miss.")
-    if c_only > 0 and b_only > 0:
-        print(f"The rule sets are COMPLEMENTARY: combined coverage "
-              f"({both_detect + b_only + c_only}/{n}) exceeds either alone.")
+    # 7. Complementarity: what does combining rules + transports give you?
+    print("--- Complementarity Analysis ---")
+    any_conv = sum(1 for r in data
+                   if r["b_conv"] == "DETECTED" or r["c_conv"] == "DETECTED")
+    any_bio = sum(1 for r in data
+                  if r["b_bio"] == "DETECTED" or r["c_bio"] == "DETECTED")
+    any_bifrost = sum(1 for r in data
+                      if r["b_conv"] == "DETECTED" or r["b_bio"] == "DETECTED")
+    any_tap = sum(1 for r in data
+                  if r["c_conv"] == "DETECTED" or r["c_bio"] == "DETECTED")
+    any_at_all = sum(1 for r in data
+                     if any(r[c] == "DETECTED" for c in FACTORIAL_CELLS))
+
+    print(f"  Any conventional rule detects: {any_conv}/{n}")
+    print(f"  Any bio rule detects:          {any_bio}/{n}")
+    print(f"  Any Bifrost capture detects:   {any_bifrost}/{n}")
+    print(f"  Any mcp-tap capture detects:   {any_tap}/{n}")
+    print(f"  Any cell at all detects:       {any_at_all}/{n}")
+    print()
+
+    # Best single cell vs combined coverage
+    print(f"  Best single cell: {best_count}/{n}")
+    print(f"  All cells combined: {any_at_all}/{n}")
+    if any_at_all > best_count:
+        print(f"  -> Combined coverage adds {any_at_all - best_count} "
+              f"scenarios over best single cell")
 
 
 if __name__ == "__main__":

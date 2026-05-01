@@ -8,11 +8,13 @@ rules against traffic captured by any source.
 
 Supported formats:
   - mcp-tap: native format, no conversion needed (passthrough)
-  - bifrost: Bifrost gateway request logs (JSON)
+  - bifrost: Bifrost gateway SQLite logs.db (mcp_tool_logs table)
+  - bifrost-json: Bifrost logs exported as JSON (legacy/API export)
   - generic: any JSON log with method/params/timestamp fields
 
 Usage:
-    python log_adapter.py --input bifrost-logs.json --format bifrost --output adapted.jsonl
+    python log_adapter.py --input bifrost-data/logs.db --format bifrost --output adapted.jsonl
+    python log_adapter.py --input bifrost-export.json --format bifrost-json --output adapted.jsonl
     python log_adapter.py --input gateway.log --format generic --output adapted.jsonl
 
 Then run detection:
@@ -21,6 +23,7 @@ Then run detection:
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,20 +31,152 @@ from pathlib import Path
 
 def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost"):
     """
-    Adapt Bifrost gateway logs to mcp-detect format.
+    Adapt Bifrost gateway logs from SQLite (logs.db) to mcp-detect format.
 
-    Bifrost logs requests and responses with OTel-aligned telemetry.
+    Reads the mcp_tool_logs table. Each row represents one tool execution
+    (request + response bundled). We split each into two mcp-detect entries:
+    a tools/call request and a response.
+
+    Input: path to Bifrost's logs.db SQLite file.
+    """
+    conn = sqlite3.connect(input_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, request_id, timestamp, tool_name, server_label,
+               arguments, result, error_details, latency, status,
+               metadata, created_at
+        FROM mcp_tool_logs
+        ORDER BY timestamp ASC, id ASC
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    adapted = []
+    sequence = 0
+
+    for row in rows:
+        ts = row["timestamp"] or row["created_at"] or datetime.now(timezone.utc).isoformat()
+        tool_name = row["tool_name"] or "unknown"
+        srv = row["server_label"] or server_id
+        request_id = row["request_id"] or row["id"]
+        latency = row["latency"]
+
+        # Parse arguments
+        args = None
+        if row["arguments"]:
+            try:
+                args = json.loads(row["arguments"])
+            except (json.JSONDecodeError, TypeError):
+                args = row["arguments"]
+
+        # Parse result
+        result = None
+        if row["result"]:
+            try:
+                result = json.loads(row["result"])
+            except (json.JSONDecodeError, TypeError):
+                result = row["result"]
+
+        # Parse error
+        error = None
+        if row["error_details"]:
+            try:
+                error = json.loads(row["error_details"])
+            except (json.JSONDecodeError, TypeError):
+                error = row["error_details"]
+
+        has_error = row["status"] == "error" or error is not None
+
+        # Entry 1: the tools/call request
+        sequence += 1
+        adapted.append({
+            "timestamp": ts,
+            "sequence": sequence,
+            "session_id": request_id,
+            "server_id": srv,
+            "direction": "client_to_server",
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": args},
+            "message_id": str(sequence),
+            "message_type": "request",
+            "latency_ms": None,
+            "hmac": None,
+            "prev_hmac": None,
+        })
+
+        # Entry 2: the response
+        sequence += 1
+        # Compute response timestamp from request + latency
+        resp_ts = ts
+        if latency is not None:
+            try:
+                req_dt = _parse_timestamp(ts)
+                if req_dt:
+                    from datetime import timedelta
+                    resp_dt = req_dt + timedelta(milliseconds=latency)
+                    resp_ts = resp_dt.isoformat()
+            except Exception:
+                pass
+
+        adapted.append({
+            "timestamp": resp_ts,
+            "sequence": sequence,
+            "session_id": request_id,
+            "server_id": srv,
+            "direction": "server_to_client",
+            "method": None,
+            "params": error if has_error else result,
+            "message_id": str(sequence - 1),  # matches request
+            "message_type": "response",
+            "is_error": has_error,
+            "latency_ms": round(latency, 2) if latency is not None else None,
+            "hmac": None,
+            "prev_hmac": None,
+        })
+
+    _write_output(adapted, output_path)
+    return len(adapted)
+
+
+def _parse_timestamp(ts: str):
+    """Best-effort parse of various timestamp formats."""
+    if not ts or not isinstance(ts, str):
+        return None
+    # Strip trailing Z
+    ts_clean = ts.replace("Z", "+00:00")
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f%z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+    ]:
+        try:
+            return datetime.strptime(ts_clean, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def adapt_bifrost_json(input_path: str, output_path: str, server_id: str = "bifrost"):
+    """
+    Adapt Bifrost gateway logs exported as JSON to mcp-detect format.
+
+    Use this for logs exported via the Bifrost API or manually extracted.
+    For direct SQLite access, use adapt_bifrost instead.
+
     Expected input: JSON array or newline-delimited JSON objects with fields:
       - timestamp (ISO 8601 or Unix epoch)
       - request.method / response.status
       - request.body / response.body (JSON-RPC content)
       - latency_ms or duration_ms
       - tool_name (if MCP tool call)
-
-    Since Bifrost's exact log format depends on version and config,
-    this adapter is lenient: it extracts whatever fields it finds
-    and maps them to the mcp-detect schema. Fields it can't find
-    are set to None.
     """
     entries = _read_input(input_path)
     adapted = []
@@ -207,6 +342,7 @@ def _write_output(entries: list[dict], path: str):
 ADAPTERS = {
     "mcp-tap": passthrough,
     "bifrost": adapt_bifrost,
+    "bifrost-json": adapt_bifrost_json,
     "generic": adapt_generic,
 }
 
