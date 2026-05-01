@@ -7,6 +7,7 @@ __pycache__/
 experiment/logs/
 experiment/data/
 experiment/bifrost-data/
+experiment/results/
 experiment/*.lock
 
 # Throwaway inspection/test scripts
@@ -16,4 +17,12 @@ experiment/test_bifrost_api2.py
 experiment/insert_test_logs.py
 experiment/check_adapted.py
 experiment/check_syntax.py
+experiment/check_syntax2.py
 experiment/test_tool_call.json
+experiment/test_mcp_endpoint*.py
+experiment/check_adapted.py
+experiment/check_new_logs.py
+experiment/check_all_logs.py
+experiment/do_commit*.bat
+experiment/run_*.bat
+experiment/test_*.bat
