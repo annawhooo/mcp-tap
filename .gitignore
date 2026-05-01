@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.claude/
+.remember/
+
+# Experiment runtime artifacts
+experiment/logs/
+experiment/data/
+experiment/bifrost-data/
+experiment/*.lock
+
+# Throwaway inspection/test scripts
+experiment/inspect_bifrost_db.py
+experiment/test_bifrost_api.py
+experiment/test_bifrost_api2.py
+experiment/insert_test_logs.py
+experiment/check_adapted.py
+experiment/check_syntax.py
+experiment/test_tool_call.json

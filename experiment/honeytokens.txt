@@ -1,0 +1,5 @@
+customer_export_2024.csv
+payroll_q3_draft.xlsx
+admin_credentials_backup.txt
+aws_keys_old.env
+database_dump_prod.sql

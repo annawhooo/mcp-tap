@@ -1,0 +1,7 @@
+{
+  "name": "filesystem",
+  "connection_type": "sse",
+  "connection_string": "http://localhost:8000/sse",
+  "is_ping_available": true,
+  "tools_to_execute": ["*"]
+}
