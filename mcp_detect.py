@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import fnmatch
 import json
 import re
 import sys
@@ -437,45 +438,114 @@ def _honeytoken_regex(token: str) -> "re.Pattern":
     return re.compile(boundary + re.escape(token) + end, re.IGNORECASE)
 
 
-def bio_004_honeytokens(messages: list[dict], honeytokens: list[str] = None) -> list[Finding]:
+def bio_004a_access(messages: list[dict], honeytokens: list[str] = None) -> list[Finding]:
     """
-    BIO-004: Honeytoken access detection.
+    BIO-004a: Honeytoken access detection (request-side).
     Principle: #2 (Infrastructure-sampled evidence). Scenario: #8 (Sleeper).
 
-    Any access to a file/resource on the honeytoken list is an alarm.
-    No legitimate workflow should ever touch these resources.
+    Detects tools/call requests that target honeytoken file paths. Triple-gated
+    (direction + message_type + method) for high specificity, since CRITICAL
+    findings need low false positive rates.
 
-    Matching is boundary-anchored (not substring) so that a honeytoken
-    named 'admin.txt' does not trigger on unrelated names like
-    'sysadmin.txt_notes'.
+    Severity tiered by attacker knowledge level:
+      - CRITICAL "direct_reference": exact honeytoken filename in argument
+        value. Boundary-anchored to prevent matching 'admin.txt' inside
+        'sysadmin.txt_notes'.
+      - MEDIUM "glob:<pattern>": glob/fnmatch pattern in argument that would
+        match a honeytoken. Indicates pattern-based search rather than
+        direct knowledge of filename.
 
-    IMPORTANT: The default honeytoken list below is for TESTING ONLY.
-    For real deployments, provide a custom list via --honeytokens CLI
-    argument. If the honeytoken names are in the source code, any
-    attacker who reads the source can avoid them.
+    The triple-gate filter excludes responses, which is critical for avoiding
+    false positives when list_directory or search_files responses contain
+    honeytoken filenames in their result text. BIO-004a is access-only:
+    response-side detection is split into BIO-004b (recon, filename in
+    listing) and BIO-004c (exfil, canary in response content). See
+    TODO_pre_publication.md for the BIO-004 family roadmap.
+
+    KNOWN LIMITATIONS (in scope to address before publication):
+      - Symlink/hardlink/copy evasion: agent accesses honeytoken via a
+        different path. To be addressed by BIO-004c (content canaries)
+        and BIO-004d (file mtime/atime tracking).
+
+    KNOWN LIMITATIONS (future research):
+      - Full path-independent verification requires OS-level audit hooks
+        (Linux auditd, Windows Object Access Auditing, macOS Endpoint
+        Security framework). This is a separate research artifact.
+
+    IMPORTANT: The default honeytoken list is for TESTING ONLY. For real
+    deployments, provide a custom list via --honeytokens CLI argument.
+    Honeytokens hard-coded in source can be evaded by attackers who read
+    the source.
     """
     if honeytokens is None:
-        # Default list for testing. Override with --honeytokens in production.
         honeytokens = DEFAULT_HONEYTOKENS
 
     patterns = [(t, _honeytoken_regex(t)) for t in honeytokens]
     findings = []
+
     for m in messages:
-        params = m.get("params")
-        if not params:
+        # Triple-gate: direction + message_type + method
+        if (m.get("direction") != "client_to_server" or
+                m.get("message_type") != "request" or
+                m.get("method") != "tools/call"):
             continue
-        params_str = json.dumps(params)
-        for token, pattern in patterns:
-            if pattern.search(params_str):
-                findings.append(Finding(
-                    rule_id="BIO-004",
-                    rule_set="bio-derived",
-                    severity="CRITICAL",
-                    description=f"Honeytoken accessed: '{token}'",
-                    evidence=[m],
-                    scenario="#8 The Sleeper / #2 Behavioral Camouflage",
-                ))
+
+        params = m.get("params")
+        if not isinstance(params, dict):
+            continue
+        args = params.get("arguments")
+        if not isinstance(args, dict):
+            continue
+
+        hits = _check_arguments_against_honeytokens(args, honeytokens, patterns)
+        for token, severity, reason in hits:
+            findings.append(Finding(
+                rule_id="BIO-004a",
+                rule_set="bio-derived",
+                severity=severity,
+                description=f"Honeytoken access via path: '{token}' ({reason})",
+                evidence=[m],
+                scenario="#8 The Sleeper / #2 Behavioral Camouflage",
+            ))
+
     return findings
+
+
+def _check_arguments_against_honeytokens(args: dict,
+                                         honeytokens: list[str],
+                                         patterns: list) -> list[tuple]:
+    """
+    Check tool call arguments against the honeytoken list.
+    Returns list of (token, severity, reason) tuples.
+
+    Tiers:
+      - CRITICAL "direct_reference": boundary-anchored exact match of a
+        honeytoken filename in any argument value
+      - MEDIUM "glob:<pattern>": glob/fnmatch pattern in known pattern-arg
+        keys that would match a honeytoken (without an exact reference
+        also being present for that token)
+    """
+    hits = []
+    args_str = json.dumps(args)
+
+    # Tier 1: boundary-anchored exact match in argument values (CRITICAL)
+    for token, pattern in patterns:
+        if pattern.search(args_str):
+            hits.append((token, "CRITICAL", "direct_reference"))
+
+    # Tier 2: glob/fnmatch pattern in known pattern-arg keys (MEDIUM)
+    pattern_keys = ("pattern", "glob", "query", "filter", "search")
+    for key in pattern_keys:
+        pattern_val = args.get(key)
+        if not isinstance(pattern_val, str) or not pattern_val:
+            continue
+        for token in honeytokens:
+            if fnmatch.fnmatch(token.lower(), pattern_val.lower()):
+                # Skip if this token already captured at CRITICAL tier
+                if not any(h[0] == token and h[1] == "CRITICAL" for h in hits):
+                    hits.append((token, "MEDIUM", f"glob:{pattern_val}"))
+
+    return hits
 
 
 def bio_005_silence_detection(messages: list[dict]) -> list[Finding]:
@@ -691,7 +761,7 @@ BIO_DERIVED_RULES = [
     bio_001_hmac_chain_integrity,
     bio_002_telemetry_gap,
     bio_003_behavioral_baseline_deviation,
-    bio_004_honeytokens,
+    bio_004a_access,
     bio_005_silence_detection,
     bio_006_functional_output_monitoring,
     bio_007_cross_server_correlation,
@@ -721,14 +791,14 @@ def run_rules(entries: list[dict], rule_set: str,
     if rule_set in ("bio-derived", "all"):
         # BIO-001 needs all entries (checks HMAC chain)
         findings.extend(bio_001_hmac_chain_integrity(entries))
-        # BIO-004 uses custom honeytokens if provided
-        findings.extend(bio_004_honeytokens(messages, honeytokens=honeytokens))
+        # BIO-004a uses custom honeytokens if provided
+        findings.extend(bio_004a_access(messages, honeytokens=honeytokens))
         # BIO-003 uses baseline if provided
         findings.extend(bio_003_behavioral_baseline_deviation(
             messages, baseline_messages=filter_messages(baseline_entries) if baseline_entries else None))
-        # Rest operate on messages only (skip 001, 003, 004 already ran)
+        # Rest operate on messages only (skip 001, 003, 004a already ran)
         for rule in BIO_DERIVED_RULES:
-            if rule in (bio_001_hmac_chain_integrity, bio_003_behavioral_baseline_deviation, bio_004_honeytokens):
+            if rule in (bio_001_hmac_chain_integrity, bio_003_behavioral_baseline_deviation, bio_004a_access):
                 continue
             findings.extend(rule(messages))
 

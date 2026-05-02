@@ -34,7 +34,7 @@ from mcp_detect import (
     bio_001_hmac_chain_integrity,
     bio_002_telemetry_gap,
     bio_003_behavioral_baseline_deviation,
-    bio_004_honeytokens,
+    bio_004a_access,
     bio_005_silence_detection,
     bio_006_functional_output_monitoring,
     bio_008_tool_schema_change,
@@ -331,33 +331,64 @@ class TestBioDerivedRules(unittest.TestCase):
         findings = bio_002_telemetry_gap(messages)
         self.assertEqual(len(findings), 0)
 
-    def test_bio_004_fires_on_honeytoken(self):
+    def test_bio_004a_fires_on_honeytoken(self):
         messages = [
-            {"direction": "client_to_server", "method": "tools/call",
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
              "params": {"name": "read_file",
                         "arguments": {"path": "/data/customer_export_2024.csv"}}},
         ]
-        findings = bio_004_honeytokens(messages)
+        findings = bio_004a_access(messages)
         self.assertTrue(len(findings) > 0)
         self.assertEqual(findings[0].severity, "CRITICAL")
 
-    def test_bio_004_silent_on_normal_file(self):
+    def test_bio_004a_silent_on_normal_file(self):
         messages = [
-            {"direction": "client_to_server", "method": "tools/call",
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
              "params": {"name": "read_file",
                         "arguments": {"path": "/data/report_q1.txt"}}},
         ]
-        findings = bio_004_honeytokens(messages)
+        findings = bio_004a_access(messages)
         self.assertEqual(len(findings), 0)
 
-    def test_bio_004_custom_honeytokens(self):
+    def test_bio_004a_custom_honeytokens(self):
         messages = [
-            {"direction": "client_to_server", "method": "tools/call",
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
              "params": {"name": "read_file",
                         "arguments": {"path": "/data/my_secret_canary.txt"}}},
         ]
-        findings = bio_004_honeytokens(messages, honeytokens=["my_secret_canary.txt"])
+        findings = bio_004a_access(messages, honeytokens=["my_secret_canary.txt"])
         self.assertTrue(len(findings) > 0)
+
+    def test_bio_004a_silent_on_response_listing(self):
+        """Regression: honeytoken filename in a list_directory response
+        must NOT fire BIO-004a. Access detection is request-side only.
+        Recon detection (filename in listing) is BIO-004b's job."""
+        messages = [
+            {"direction": "server_to_client", "message_type": "response",
+             "method": "tools/call", "message_id": "1",
+             "params": {"content": [{"type": "text",
+                                     "text": "report.txt\ncustomer_export_2024.csv\nnotes.md"}]}},
+        ]
+        findings = bio_004a_access(messages)
+        self.assertEqual(len(findings), 0)
+
+    def test_bio_004a_glob_pattern_match(self):
+        """Glob/fnmatch pattern in search-style argument that matches a
+        honeytoken fires at MEDIUM severity (pattern-based search rather
+        than direct filename knowledge)."""
+        messages = [
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
+             "params": {"name": "search_files",
+                        "arguments": {"pattern": "customer_export_*"}}},
+        ]
+        findings = bio_004a_access(messages)
+        self.assertTrue(len(findings) > 0)
+        self.assertEqual(findings[0].severity, "MEDIUM")
+        self.assertIn("glob:", findings[0].description)
 
     def test_bio_008_fires_on_schema_change(self):
         messages = [
@@ -400,7 +431,7 @@ class TestComplementarity(unittest.TestCase):
              "sequence": 1, "timestamp": "2026-04-08T14:00:00+00:00"},
         ]
         conv = conv_004_credential_scope(messages)
-        bio = bio_004_honeytokens(messages)
+        bio = bio_004a_access(messages)
         self.assertEqual(len(conv), 0, "Conventional should NOT catch honeytokens")
         self.assertTrue(len(bio) > 0, "Bio-derived SHOULD catch honeytokens")
 
