@@ -52,6 +52,16 @@ Tasks:
 - Document the gate-count → severity mapping per rule (see methodology section)
 - Bundle BIO-002 / BIO-002b rename with this sweep (BIO-002 is a family, sub-rules should be 002a / 002b for orphan-request / orphan-response, matching BIO-004 family pattern)
 
+### CONV-005 near-dead-rule check
+CONV-005 (enumeration) fires on `tools/list` and `resources/list` METHOD calls. None of the 12 attack scenarios in the experiment issue explicit `tools/list` calls; only the initial protocol handshake does, and Group B (Bifrost) does not capture protocol-level traffic. Suspected outcome:
+- Group C: fires once per scenario on the handshake (likely below threshold of 3)
+- Group B: never fires (NOT_OBSERVABLE)
+
+Either the rule needs a redefinition that tracks scenario-relevant enumeration patterns (e.g., repeated `list_directory` of overlapping paths), or it should be retired from this experiment and documented as inapplicable. Decide after v1 results.
+
+### BIO-007 not applicable for v1
+BIO-007 (cross-server correlation) requires multiple `server_id` values. The current experiment uses a single filesystem server. Rule will not fire. For v2, expand to multi-server scenarios (e.g., filesystem + database + network) to exercise the rule.
+
 ## Methodology Section (Motion Detector Paper)
 
 Capture the framework that emerged from the BIO-004 review session:
@@ -118,3 +128,9 @@ Fixes worth documenting in the paper as evidence that the framework surfaced rea
 **Actual root cause:** Asymmetric `in_tail` filtering. The tail-window filter was applied to requests only (correctly preventing BIO-002 false positives on requests whose responses hadn't arrived yet), but NOT to responses. This tore matched pairs apart: requests excluded, responses retained as "orphans" → BIO-002b false positive.
 **Framework concern:** Completeness.
 **Fix:** Apply `in_tail` symmetrically to both requests and responses. Tradeoff: a true orphan response within the tail window is now a false negative — acceptable because tail data is incomplete by definition.
+
+### BIO-004a Tier 2 missing ** glob support (FIXED, commit 120b7e0)
+**Symptom:** Honeytoken glob patterns like `**/*.csv` (used by s09's `search_files` calls) did not fire MEDIUM tier hits against flat honeytoken filenames like `customer_export_2024.csv`.
+**Root cause:** Standard Python `fnmatch.fnmatch` does not honor `**` for recursive directory matching; it treats the pattern as requiring at least one `/` separator. Flat filenames never matched.
+**Framework concern:** Specificity (the tier 2 heuristic was systematically under-firing).
+**Fix:** Replaced `fnmatch.fnmatch` with a custom `_glob_to_regex` translator that handles `**` (any chars including slashes), `**/` (optional any-prefix), `*` (non-slash chars), `?` (single non-slash char). This made s09 expected to fire BIO-004a MEDIUM ×3 and s22 ×5, both of which would have been false negatives under fnmatch.
