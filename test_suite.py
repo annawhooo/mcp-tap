@@ -331,6 +331,51 @@ class TestBioDerivedRules(unittest.TestCase):
         findings = bio_002_telemetry_gap(messages)
         self.assertEqual(len(findings), 0)
 
+    def test_bio_002b_silent_on_matched_pair_in_tail(self):
+        """REGRESSION: matched request/response pair within the tail window
+        must NOT fire BIO-002b. Previously, in_tail filtered requests but
+        not responses, tearing pairs apart and creating orphan responses."""
+        messages = [
+            # Pair before tail — both kept, matched
+            {"direction": "client_to_server", "message_type": "request",
+             "message_id": "1", "method": "tools/call",
+             "timestamp": "2026-01-01T22:00:00+00:00"},
+            {"direction": "server_to_client", "message_type": "response",
+             "message_id": "1",
+             "timestamp": "2026-01-01T22:00:01+00:00"},
+            # Pair inside tail — both must be excluded together
+            {"direction": "client_to_server", "message_type": "request",
+             "message_id": "2", "method": "tools/call",
+             "timestamp": "2026-01-01T22:00:10+00:00"},
+            {"direction": "server_to_client", "message_type": "response",
+             "message_id": "2",
+             "timestamp": "2026-01-01T22:00:11+00:00"},
+        ]
+        findings = bio_002_telemetry_gap(messages)
+        self.assertEqual(len(findings), 0,
+                         f"Expected no findings, got: {[f.rule_id for f in findings]}")
+
+    def test_bio_002b_fires_on_true_orphan_outside_tail(self):
+        """A response without a matching request, occurring outside the tail
+        window, must still fire BIO-002b. Confirms the fix didn't over-correct."""
+        messages = [
+            # True orphan response — no matching request, well outside tail
+            {"direction": "server_to_client", "message_type": "response",
+             "message_id": "99",
+             "timestamp": "2026-01-01T22:00:00+00:00"},
+            # Push last_ts forward so the orphan is comfortably outside tail
+            {"direction": "client_to_server", "message_type": "request",
+             "message_id": "1", "method": "tools/call",
+             "timestamp": "2026-01-01T22:00:10+00:00"},
+            {"direction": "server_to_client", "message_type": "response",
+             "message_id": "1",
+             "timestamp": "2026-01-01T22:00:11+00:00"},
+        ]
+        findings = bio_002_telemetry_gap(messages)
+        bio_002b_findings = [f for f in findings if f.rule_id == "BIO-002b"]
+        self.assertTrue(len(bio_002b_findings) > 0,
+                        "Expected BIO-002b to fire on true orphan response outside tail")
+
     def test_bio_004a_fires_on_honeytoken(self):
         messages = [
             {"direction": "client_to_server", "message_type": "request",

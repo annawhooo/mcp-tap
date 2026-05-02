@@ -289,10 +289,11 @@ def _parse_ts(ts: str):
         return None
 
 
-# Tail window: requests in the last N seconds of the log are excluded
-# from orphan detection, since their responses may simply not have
-# arrived before the log was read. This matches operational reality:
-# a log snapshot always truncates mid-conversation.
+# Tail window: messages in the last N seconds of the log are excluded
+# from orphan detection symmetrically (both requests and responses),
+# since the log snapshot always truncates mid-conversation. Asymmetric
+# exclusion would tear matched pairs apart and create false positives
+# on the side that wasn't filtered.
 BIO_002_TAIL_SECONDS = 5.0
 
 
@@ -306,10 +307,17 @@ def bio_002_telemetry_gap(messages: list[dict],
     something is being suppressed or dropped. The ABSENCE of expected
     messages is the signal (NK cell missing-self model).
 
-    Requests within `tail_seconds` of the last observed message are
-    excluded — their responses may simply not have been captured yet
-    when the log was read. Without this, every truncated log would
-    false-positive.
+    Messages within `tail_seconds` of the last observed message are
+    excluded SYMMETRICALLY (both requests and responses) — the log may
+    have been truncated mid-exchange, and we can't reliably distinguish
+    "truly orphan" from "pair member not yet flushed." Excluding tail
+    messages as a unit keeps matched pairs together; excluding only
+    requests would tear pairs apart and create BIO-002b false positives
+    on responses whose requests got tail-filtered.
+
+    Tradeoff: a true orphan response within the tail window will be
+    missed (false negative). Acceptable because tail data is incomplete
+    by definition.
     """
     findings = []
 
@@ -334,7 +342,9 @@ def bio_002_telemetry_gap(messages: list[dict],
                 and m.get("message_id")
                 and not in_tail(m)}
     responses = {str(m.get("message_id")): m for m in messages
-                 if m.get("message_type") == "response" and m.get("message_id")}
+                 if m.get("message_type") == "response"
+                 and m.get("message_id")
+                 and not in_tail(m)}
 
     orphan_requests = set(requests.keys()) - set(responses.keys())
     orphan_responses = set(responses.keys()) - set(requests.keys())

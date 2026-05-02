@@ -77,6 +77,15 @@ Capture the framework that emerged from the BIO-004 review session:
 - BIO-004a + NOT BIO-004c = blocked or read-only learning (intent observed, no exfil)
 - BIO-004d alone = full bypass (no logged access but file shows engagement)
 
+**Gating vs completeness as orthogonal framework concerns:** Two distinct framework-level concerns surface in detection rule design, and they must not be conflated:
+
+| Concern | Question | Bug example | Fix shape |
+|---------|----------|-------------|-----------|
+| **Gating** | Which messages does the rule examine? | BIO-004 firing on responses (false positive) | Add filter primitives (direction, message_type, method) |
+| **Completeness** | When is the data complete enough to draw a conclusion? | BIO-002b firing on tail-window pairs (false positive) | Apply temporal/contextual filters symmetrically across paired entities |
+
+Gating bugs produce *over-firing on the wrong message types*. Completeness bugs produce *over-firing on incomplete data slices*. They have different mental models for diagnosis and different fix shapes. A rule can be correctly gated and still have completeness bugs (or vice versa). Both must be reasoned about explicitly per rule.
+
 This is paper-worthy framing for the methodology section.
 
 ## Future Research (Out of Scope for This Paper)
@@ -92,3 +101,20 @@ This is paper-worthy framing for the methodology section.
 ### Content transformation evasion
 - Attackers who base64/encrypt/partially-read honeytoken content defeat BIO-004c canary detection
 - Open question: behavioral detection of transformation operations as a separate signal
+
+## Bug Fix History (for paper limitations / methodology section)
+
+Fixes worth documenting in the paper as evidence that the framework surfaced real issues during empirical testing:
+
+### BIO-004 false positive on directory listings (FIXED, commit 39ee276)
+**Symptom:** BIO-004 fired on `list_directory` responses that contained honeytoken filenames in their result text, even when no actual access occurred.
+**Root cause:** Rule did not gate by direction or method; it string-matched honeytokens against the entire `params` blob of every message.
+**Framework concern:** Gating.
+**Fix:** Triple-gate (direction + message_type + method) restricting rule to `tools/call` requests. Renamed BIO-004 → BIO-004a to reserve the family namespace for the recon (004b), exfil (004c), and stealth (004d) sub-rules.
+
+### BIO-002b false positive on tail-window pairs (FIXED)
+**Symptom:** BIO-002b fired on matched request/response pairs occurring within the tail window at log truncation.
+**Root cause originally suspected:** Lifecycle events (genesis, server_start). This was wrong — lifecycle events don't have a `direction` field and are already filtered by `filter_messages()`.
+**Actual root cause:** Asymmetric `in_tail` filtering. The tail-window filter was applied to requests only (correctly preventing BIO-002 false positives on requests whose responses hadn't arrived yet), but NOT to responses. This tore matched pairs apart: requests excluded, responses retained as "orphans" → BIO-002b false positive.
+**Framework concern:** Completeness.
+**Fix:** Apply `in_tail` symmetrically to both requests and responses. Tradeoff: a true orphan response within the tail window is now a false negative — acceptable because tail data is incomplete by definition.
