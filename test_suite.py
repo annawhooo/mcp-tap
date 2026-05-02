@@ -435,6 +435,52 @@ class TestBioDerivedRules(unittest.TestCase):
         self.assertEqual(findings[0].severity, "MEDIUM")
         self.assertIn("glob:", findings[0].description)
 
+    def test_bio_004a_double_star_matches_flat_filename(self):
+        """REGRESSION: pattern '**/*.csv' must match a flat honeytoken
+        filename 'customer_export_2024.csv'. Standard fnmatch does NOT
+        match this case (it requires a literal slash). The custom
+        _glob_to_regex translator handles ** with proper directory
+        semantics."""
+        messages = [
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
+             "params": {"name": "search_files",
+                        "arguments": {"pattern": "**/*.csv"}}},
+        ]
+        findings = bio_004a_access(messages)
+        self.assertTrue(len(findings) > 0,
+                        "Expected ** to match flat honeytoken filename")
+        self.assertEqual(findings[0].severity, "MEDIUM")
+
+    def test_bio_004a_double_star_matches_nested_filename(self):
+        """Pattern '**/*.csv' must also match a honeytoken with a directory
+        prefix like 'data/secret.csv'."""
+        messages = [
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
+             "params": {"name": "search_files",
+                        "arguments": {"pattern": "**/*.csv"}}},
+        ]
+        findings = bio_004a_access(messages,
+                                   honeytokens=["data/secret.csv"])
+        self.assertTrue(len(findings) > 0,
+                        "Expected ** to match nested honeytoken filename")
+
+    def test_bio_004a_single_star_does_not_cross_slash(self):
+        """Single * must not match across slash boundaries. Pattern '*.csv'
+        should NOT match 'data/secret.csv'. Confirms the translator gives
+        single * non-slash-spanning semantics."""
+        messages = [
+            {"direction": "client_to_server", "message_type": "request",
+             "method": "tools/call",
+             "params": {"name": "search_files",
+                        "arguments": {"pattern": "*.csv"}}},
+        ]
+        findings = bio_004a_access(messages,
+                                   honeytokens=["data/secret.csv"])
+        self.assertEqual(len(findings), 0,
+                         "Expected single-star NOT to cross slash")
+
     def test_bio_008_fires_on_schema_change(self):
         messages = [
             {"direction": "server_to_client", "message_type": "response",
