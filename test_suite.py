@@ -543,6 +543,197 @@ class TestComplementarity(unittest.TestCase):
 
 
 # ===================================================================
+# Log adapter tests
+# ===================================================================
+
+class TestNormalizeMicroseconds(unittest.TestCase):
+    """Unit tests for _normalize_microseconds (string-level transform)."""
+
+    def setUp(self):
+        from log_adapter import _normalize_microseconds
+        self.normalize = _normalize_microseconds
+
+    def test_truncates_seven_digit_microseconds(self):
+        """Bifrost / Go RFC3339Nano writes 7 digits — strptime cannot handle."""
+        self.assertEqual(
+            self.normalize("2026-05-01 21:25:34.0455463+00:00"),
+            "2026-05-01 21:25:34.045546+00:00",
+        )
+
+    def test_truncates_nine_digit_nanoseconds(self):
+        self.assertEqual(
+            self.normalize("2026-05-01T21:25:34.123456789Z"),
+            "2026-05-01T21:25:34.123456Z",
+        )
+
+    def test_passes_six_digit_microseconds_unchanged(self):
+        ts = "2026-05-01 21:25:34.045546+00:00"
+        self.assertEqual(self.normalize(ts), ts)
+
+    def test_passes_one_through_five_digit_fractions_unchanged(self):
+        for frac_len in range(1, 6):
+            frac = "1" * frac_len
+            ts = f"2026-05-01 21:25:34.{frac}+00:00"
+            with self.subTest(frac_len=frac_len):
+                self.assertEqual(self.normalize(ts), ts)
+
+    def test_passes_no_fractional_part_unchanged(self):
+        ts = "2026-05-01 21:25:34+00:00"
+        self.assertEqual(self.normalize(ts), ts)
+
+    def test_handles_no_timezone_suffix(self):
+        self.assertEqual(
+            self.normalize("2026-05-01T21:25:34.0455463"),
+            "2026-05-01T21:25:34.045546",
+        )
+
+    def test_handles_non_string_input(self):
+        self.assertIsNone(self.normalize(None))
+        self.assertEqual(self.normalize(12345), 12345)
+
+
+class TestParseTimestamp(unittest.TestCase):
+    """End-to-end test that _parse_timestamp succeeds on Bifrost's actual format."""
+
+    def test_parses_bifrost_seven_digit_microseconds(self):
+        from log_adapter import _parse_timestamp
+        result = _parse_timestamp("2026-05-01 21:25:34.0455463+00:00")
+        self.assertIsNotNone(result, "Bifrost's 7-digit µs format must parse")
+        self.assertEqual(result.year, 2026)
+        self.assertEqual(result.microsecond, 45546)
+
+
+class TestAdaptBifrostWindowing(unittest.TestCase):
+    """Tests for adapt_bifrost time-window filtering used by experiment slicer."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        import os
+        # Build a synthetic Bifrost logs.db with 5 rows at known timestamps
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "logs.db")
+        self.out_path = os.path.join(self.tmpdir, "out.jsonl")
+        conn = sqlite3.connect(self.db_path)
+        # Mirror the relevant subset of Bifrost's mcp_tool_logs schema
+        conn.execute("""
+            CREATE TABLE mcp_tool_logs (
+                id INTEGER PRIMARY KEY,
+                request_id TEXT,
+                timestamp TEXT NOT NULL,
+                tool_name TEXT,
+                server_label TEXT,
+                arguments TEXT,
+                result TEXT,
+                error_details TEXT,
+                latency REAL,
+                status TEXT,
+                metadata TEXT,
+                created_at TEXT
+            )
+        """)
+        # Five rows at 1-second intervals, 7-digit µs (Bifrost format)
+        timestamps = [
+            "2026-05-01 21:00:00.0000000+00:00",  # row 1
+            "2026-05-01 21:00:01.0000000+00:00",  # row 2
+            "2026-05-01 21:00:02.0000000+00:00",  # row 3
+            "2026-05-01 21:00:03.0000000+00:00",  # row 4
+            "2026-05-01 21:00:04.0000000+00:00",  # row 5
+        ]
+        for i, ts in enumerate(timestamps, start=1):
+            conn.execute(
+                "INSERT INTO mcp_tool_logs (id, request_id, timestamp, tool_name, "
+                "server_label, arguments, result, latency, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (i, f"req-{i}", ts, "list_directory", "fs",
+                 '{"path":"/tmp"}', '{"content":[]}', 5.0, "success", ts),
+            )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _read_output(self):
+        import json as _json
+        with open(self.out_path) as f:
+            return [_json.loads(line) for line in f if line.strip()]
+
+    def test_no_window_returns_all_rows(self):
+        """5 rows × 2 entries (req+resp) = 10 entries when no window applied."""
+        from log_adapter import adapt_bifrost
+        count = adapt_bifrost(self.db_path, self.out_path)
+        self.assertEqual(count, 10)
+        entries = self._read_output()
+        self.assertEqual(len(entries), 10)
+
+    def test_window_includes_only_matching_rows(self):
+        """Window covering rows 2–3 yields 2 rows × 2 entries = 4 entries."""
+        from log_adapter import adapt_bifrost, _parse_timestamp
+        start = _parse_timestamp("2026-05-01 21:00:01.0000000+00:00")
+        end = _parse_timestamp("2026-05-01 21:00:03.0000000+00:00")
+        count = adapt_bifrost(self.db_path, self.out_path,
+                              start_ts=start, end_ts=end)
+        self.assertEqual(count, 4)
+        entries = self._read_output()
+        # Both entries for row 2 and row 3 should be present
+        request_ids = {e["session_id"] for e in entries}
+        self.assertEqual(request_ids, {"req-2", "req-3"})
+
+    def test_right_boundary_is_exclusive(self):
+        """end_ts == row.timestamp must EXCLUDE that row."""
+        from log_adapter import adapt_bifrost, _parse_timestamp
+        start = _parse_timestamp("2026-05-01 21:00:00.0000000+00:00")
+        end = _parse_timestamp("2026-05-01 21:00:02.0000000+00:00")  # row 3's exact ts
+        count = adapt_bifrost(self.db_path, self.out_path,
+                              start_ts=start, end_ts=end)
+        # Should include rows 1 and 2 only (row 3 excluded by right-exclusive)
+        self.assertEqual(count, 4)
+        entries = self._read_output()
+        request_ids = {e["session_id"] for e in entries}
+        self.assertEqual(request_ids, {"req-1", "req-2"})
+
+    def test_left_boundary_is_inclusive(self):
+        """start_ts == row.timestamp must INCLUDE that row."""
+        from log_adapter import adapt_bifrost, _parse_timestamp
+        start = _parse_timestamp("2026-05-01 21:00:02.0000000+00:00")  # row 3's exact ts
+        end = _parse_timestamp("2026-05-01 21:00:05.0000000+00:00")
+        count = adapt_bifrost(self.db_path, self.out_path,
+                              start_ts=start, end_ts=end)
+        # Should include rows 3, 4, 5
+        self.assertEqual(count, 6)
+        entries = self._read_output()
+        request_ids = {e["session_id"] for e in entries}
+        self.assertEqual(request_ids, {"req-3", "req-4", "req-5"})
+
+    def test_window_with_no_matches_yields_empty_output(self):
+        from log_adapter import adapt_bifrost, _parse_timestamp
+        start = _parse_timestamp("2027-01-01 00:00:00.0000000+00:00")
+        end = _parse_timestamp("2027-01-02 00:00:00.0000000+00:00")
+        count = adapt_bifrost(self.db_path, self.out_path,
+                              start_ts=start, end_ts=end)
+        self.assertEqual(count, 0)
+        entries = self._read_output()
+        self.assertEqual(entries, [])
+
+    def test_only_one_bound_provided_raises(self):
+        from log_adapter import adapt_bifrost, _parse_timestamp
+        start = _parse_timestamp("2026-05-01 21:00:00.0000000+00:00")
+        with self.assertRaises(ValueError):
+            adapt_bifrost(self.db_path, self.out_path, start_ts=start)
+        with self.assertRaises(ValueError):
+            adapt_bifrost(self.db_path, self.out_path, end_ts=start)
+
+    def test_end_before_start_raises(self):
+        from log_adapter import adapt_bifrost, _parse_timestamp
+        start = _parse_timestamp("2026-05-01 21:00:05.0000000+00:00")
+        end = _parse_timestamp("2026-05-01 21:00:00.0000000+00:00")
+        with self.assertRaises(ValueError):
+            adapt_bifrost(self.db_path, self.out_path, start_ts=start, end_ts=end)
+
+
+# ===================================================================
 # Run
 # ===================================================================
 

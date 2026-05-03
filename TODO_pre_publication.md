@@ -62,6 +62,9 @@ Either the rule needs a redefinition that tracks scenario-relevant enumeration p
 ### BIO-007 not applicable for v1
 BIO-007 (cross-server correlation) requires multiple `server_id` values. The current experiment uses a single filesystem server. Rule will not fire. For v2, expand to multi-server scenarios (e.g., filesystem + database + network) to exercise the rule.
 
+### Consolidate timestamp parsing
+Two ISO 8601 parsers ship in the codebase: `log_adapter._parse_timestamp` (strptime loop over 8 formats, used for response timestamp arithmetic and scenario windowing) and `mcp_detect._parse_ts` (fromisoformat, used for tail-window filtering and latency calc). They have different format coverage and different µs-handling behavior. Risk: future maintenance drift. Consolidate into a single shared helper used by both modules. Out of scope for v1 experiment; track for post-experiment cleanup.
+
 ## Methodology Section (Motion Detector Paper)
 
 Capture the framework that emerged from the BIO-004 review session:

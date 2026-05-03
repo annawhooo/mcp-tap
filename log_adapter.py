@@ -23,13 +23,15 @@ Then run detection:
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost"):
+def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost",
+                  start_ts: datetime = None, end_ts: datetime = None):
     """
     Adapt Bifrost gateway logs from SQLite (logs.db) to mcp-detect format.
 
@@ -38,7 +40,21 @@ def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost")
     a tools/call request and a response.
 
     Input: path to Bifrost's logs.db SQLite file.
+
+    Optional time-window filtering (used by the experiment orchestrator's
+    slicer to extract per-scenario subsets from a single shared logs.db):
+      start_ts: include rows with timestamp >= start_ts (inclusive lower bound)
+      end_ts:   include rows with timestamp <  end_ts   (exclusive upper bound)
+    Both must be timezone-aware datetime objects when provided. Rows whose
+    `timestamp` field cannot be parsed are dropped with a warning to stderr
+    when window args are present (otherwise included as before).
     """
+    if (start_ts is None) != (end_ts is None):
+        raise ValueError("start_ts and end_ts must both be provided or both omitted")
+    if start_ts is not None and end_ts <= start_ts:
+        raise ValueError(f"end_ts ({end_ts}) must be > start_ts ({start_ts})")
+    windowed = start_ts is not None
+
     conn = sqlite3.connect(input_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -56,9 +72,21 @@ def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost")
 
     adapted = []
     sequence = 0
+    skipped_unparseable = 0
 
     for row in rows:
         ts = row["timestamp"] or row["created_at"] or datetime.now(timezone.utc).isoformat()
+
+        # Window filtering when start_ts/end_ts provided
+        if windowed:
+            row_dt = _parse_timestamp(ts)
+            if row_dt is None:
+                skipped_unparseable += 1
+                print(f"WARN: log_adapter: dropping row {row['id']} with "
+                      f"unparseable timestamp: {ts!r}", file=sys.stderr)
+                continue
+            if row_dt < start_ts or row_dt >= end_ts:
+                continue
         tool_name = row["tool_name"] or "unknown"
         srv = row["server_label"] or server_id
         request_id = row["request_id"] or row["id"]
@@ -141,12 +169,47 @@ def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost")
     return len(adapted)
 
 
+def _normalize_microseconds(ts: str) -> str:
+    """
+    Truncate fractional seconds to 6 digits (microsecond precision).
+
+    Python's stdlib `%f` strptime directive only handles 1-6 digit
+    fractional seconds. Some log sources (Bifrost via Go's RFC3339Nano,
+    some Rust libraries) write 7+ digit fractional seconds — typically
+    100ns "ticks" — which strptime cannot parse.
+
+    This helper trims fractional digits to 6 if longer, leaving everything
+    else untouched. Naive timestamps without fractional seconds, with
+    timezone suffixes, or with 1-6 digit fractions all pass through
+    unchanged.
+
+    Examples:
+      "2026-05-01 21:25:34.0455463+00:00" → "2026-05-01 21:25:34.045546+00:00"
+      "2026-05-01 21:25:34.045546+00:00"  → unchanged (already 6 digits)
+      "2026-05-01 21:25:34+00:00"         → unchanged (no fractional part)
+      "2026-05-01T21:25:34.0455463Z"      → "2026-05-01T21:25:34.045546Z"
+    """
+    if not isinstance(ts, str) or "." not in ts:
+        return ts
+    # Match: prefix up through ".", then 7+ digits, then suffix (tz or end)
+    m = re.match(r"^(.*\.)(\d{7,})(.*)$", ts)
+    if not m:
+        return ts
+    prefix, frac, suffix = m.groups()
+    return f"{prefix}{frac[:6]}{suffix}"
+
+
 def _parse_timestamp(ts: str):
-    """Best-effort parse of various timestamp formats."""
+    """Best-effort parse of various timestamp formats. Returns None on failure.
+
+    Normalizes 7+ digit fractional seconds to 6 digits before parsing
+    (see _normalize_microseconds). Tries 8 ISO 8601 variants covering
+    space-separated and T-separated, with and without microseconds,
+    with and without timezone offset.
+    """
     if not ts or not isinstance(ts, str):
         return None
-    # Strip trailing Z
-    ts_clean = ts.replace("Z", "+00:00")
+    ts_clean = _normalize_microseconds(ts).replace("Z", "+00:00")
     for fmt in [
         "%Y-%m-%dT%H:%M:%S.%f%z",
         "%Y-%m-%dT%H:%M:%S%z",
@@ -358,13 +421,34 @@ def main():
     parser.add_argument("--output", required=True, help="Path to output JSONL file")
     parser.add_argument("--server-id", default=None,
                         help="Server ID to assign if not present in logs")
+    parser.add_argument("--start-ts", default=None,
+                        help="ISO 8601 lower bound (inclusive) for row timestamp. "
+                             "Bifrost format only. Must be used with --end-ts.")
+    parser.add_argument("--end-ts", default=None,
+                        help="ISO 8601 upper bound (exclusive) for row timestamp. "
+                             "Bifrost format only. Must be used with --start-ts.")
 
     args = parser.parse_args()
+
+    # Validate window args
+    if (args.start_ts is None) != (args.end_ts is None):
+        parser.error("--start-ts and --end-ts must be used together")
+    if args.start_ts is not None and args.format != "bifrost":
+        parser.error("--start-ts/--end-ts only supported with --format bifrost")
 
     adapter = ADAPTERS[args.format]
     kwargs = {}
     if args.server_id:
         kwargs["server_id"] = args.server_id
+    if args.start_ts is not None:
+        start_dt = _parse_timestamp(args.start_ts)
+        end_dt = _parse_timestamp(args.end_ts)
+        if start_dt is None:
+            parser.error(f"--start-ts could not be parsed: {args.start_ts!r}")
+        if end_dt is None:
+            parser.error(f"--end-ts could not be parsed: {args.end_ts!r}")
+        kwargs["start_ts"] = start_dt
+        kwargs["end_ts"] = end_dt
 
     count = adapter(args.input, args.output, **kwargs)
     print(f"Adapted {count} entries from {args.format} format to {args.output}")
