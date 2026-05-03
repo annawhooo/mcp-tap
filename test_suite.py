@@ -734,6 +734,267 @@ class TestAdaptBifrostWindowing(unittest.TestCase):
 
 
 # ===================================================================
+# Run experiment orchestrator tests
+# ===================================================================
+
+class TestNextRunDir(unittest.TestCase):
+    """Tests for run-NNN auto-increment."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_first_run_in_empty_dir(self):
+        from run_experiment import next_run_dir
+        result = next_run_dir(self.tmpdir)
+        self.assertEqual(result.name, "run-001")
+
+    def test_increments_past_existing_runs(self):
+        from run_experiment import next_run_dir
+        (self.tmpdir / "run-001").mkdir()
+        (self.tmpdir / "run-002").mkdir()
+        (self.tmpdir / "run-005").mkdir()  # gap should be ignored
+        result = next_run_dir(self.tmpdir)
+        self.assertEqual(result.name, "run-006")
+
+    def test_ignores_non_run_directories(self):
+        from run_experiment import next_run_dir
+        (self.tmpdir / "run-001").mkdir()
+        (self.tmpdir / "scratch").mkdir()
+        (self.tmpdir / "run-abc").mkdir()  # malformed
+        result = next_run_dir(self.tmpdir)
+        self.assertEqual(result.name, "run-002")
+
+    def test_creates_logs_dir_if_missing(self):
+        from run_experiment import next_run_dir
+        nonexistent = self.tmpdir / "deep" / "nested" / "logs"
+        result = next_run_dir(nonexistent)
+        self.assertTrue(nonexistent.is_dir())
+        self.assertEqual(result.name, "run-001")
+
+
+class TestGetGitInfo(unittest.TestCase):
+    """Tests for git commit + dirty-tree capture, with subprocess mocked."""
+
+    def test_clean_tree(self):
+        from unittest.mock import patch, MagicMock
+        from run_experiment import get_git_info
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if "rev-parse" in cmd:
+                mock.stdout = "abc123def456\n"
+            else:  # status --porcelain
+                mock.stdout = ""  # clean
+            return mock
+
+        with patch("run_experiment.subprocess.run", side_effect=fake_run):
+            from pathlib import Path
+            info = get_git_info(Path("/tmp"))
+        self.assertEqual(info["commit"], "abc123def456")
+        self.assertFalse(info["dirty"])
+
+    def test_dirty_tree(self):
+        from unittest.mock import patch, MagicMock
+        from run_experiment import get_git_info
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if "rev-parse" in cmd:
+                mock.stdout = "abc123\n"
+            else:
+                mock.stdout = " M file.py\n?? new.py\n"
+            return mock
+
+        with patch("run_experiment.subprocess.run", side_effect=fake_run):
+            from pathlib import Path
+            info = get_git_info(Path("/tmp"))
+        self.assertEqual(info["commit"], "abc123")
+        self.assertTrue(info["dirty"])
+
+    def test_git_not_installed(self):
+        from unittest.mock import patch
+        from run_experiment import get_git_info
+
+        with patch("run_experiment.subprocess.run", side_effect=FileNotFoundError("git")):
+            from pathlib import Path
+            info = get_git_info(Path("/tmp"))
+        self.assertIsNone(info["commit"])
+        self.assertIn("error", info)
+
+
+class TestRunExperimentOrchestration(unittest.TestCase):
+    """Tests for the full orchestration loop with subprocess + filesystem mocked."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.run_dir = self.tmpdir / "run-001"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _mock_subprocess_run_factory(self, scenario_outcomes):
+        """Build a fake subprocess.run that returns success for setup_data
+        and the configured outcome for each scenario_runner invocation.
+
+        scenario_outcomes: list of (returncode, stdout) tuples in scenario order.
+        """
+        from unittest.mock import MagicMock
+        outcome_iter = iter(scenario_outcomes)
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            cmd_str = " ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)
+            if "setup_data.py" in cmd_str:
+                mock.returncode = 0
+                mock.stdout = "Reset done\n"
+                mock.stderr = ""
+            elif "scenario_runner.py" in cmd_str:
+                rc, out = next(outcome_iter)
+                mock.returncode = rc
+                mock.stdout = out
+                mock.stderr = ""
+            elif "rev-parse" in cmd_str:
+                mock.returncode = 0
+                mock.stdout = "test_commit_sha\n"
+                mock.stderr = ""
+            elif "status" in cmd_str:
+                mock.returncode = 0
+                mock.stdout = ""
+                mock.stderr = ""
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+                mock.stderr = ""
+            return mock
+
+        return fake_run
+
+    def test_all_scenarios_succeed(self):
+        from unittest.mock import patch
+        from run_experiment import run_experiment
+        import json as _json
+
+        scenarios = ["baseline", "s02"]
+        outcomes = [(0, "ok"), (0, "ok")]
+
+        with patch("run_experiment.subprocess.run",
+                   side_effect=self._mock_subprocess_run_factory(outcomes)), \
+             patch("run_experiment.time.sleep"):
+            run_meta = run_experiment(
+                group="c", run_dir=self.run_dir, scenarios=scenarios,
+                inter_scenario_gap=0.0, bifrost_url="http://x",
+            )
+
+        self.assertEqual(run_meta["scenarios_succeeded"], ["baseline", "s02"])
+        self.assertEqual(run_meta["scenarios_failed"], [])
+        self.assertEqual(run_meta["commit"], "test_commit_sha")
+        self.assertFalse(run_meta["dirty_tree"])
+
+        # Verify windows.json
+        windows = _json.loads((self.run_dir / "windows.json").read_text())
+        self.assertEqual(set(windows.keys()), {"baseline", "s02"})
+        for sid, w in windows.items():
+            self.assertEqual(w["status"], "ok")
+            self.assertEqual(w["exit_code"], 0)
+            self.assertIn("start_ts", w)
+            self.assertIn("end_ts", w)
+
+        # Verify run_meta.json written
+        run_meta_file = _json.loads((self.run_dir / "run_meta.json").read_text())
+        self.assertEqual(run_meta_file["group"], "c")
+        self.assertEqual(run_meta_file["scenarios_attempted"], scenarios)
+
+        # Verify run.log exists
+        self.assertTrue((self.run_dir / "run.log").exists())
+
+    def test_one_scenario_fails_others_continue(self):
+        from unittest.mock import patch
+        from run_experiment import run_experiment
+
+        scenarios = ["baseline", "s02", "s08"]
+        outcomes = [(0, "ok"), (1, "ERROR: tool call failed"), (0, "ok")]
+
+        with patch("run_experiment.subprocess.run",
+                   side_effect=self._mock_subprocess_run_factory(outcomes)), \
+             patch("run_experiment.time.sleep"):
+            run_meta = run_experiment(
+                group="c", run_dir=self.run_dir, scenarios=scenarios,
+                inter_scenario_gap=0.0, bifrost_url="http://x",
+            )
+
+        self.assertEqual(run_meta["scenarios_succeeded"], ["baseline", "s08"])
+        self.assertEqual(run_meta["scenarios_failed"], ["s02"])
+
+    def test_setup_data_failure_aborts_run(self):
+        """Fatal setup_data failure should abort the run, not continue."""
+        from unittest.mock import patch, MagicMock
+        from run_experiment import run_experiment
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            cmd_str = " ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)
+            if "setup_data.py" in cmd_str:
+                mock.returncode = 1
+                mock.stdout = ""
+                mock.stderr = "permission denied"
+            elif "rev-parse" in cmd_str or "status" in cmd_str:
+                mock.returncode = 0
+                mock.stdout = "abc\n" if "rev-parse" in cmd_str else ""
+                mock.stderr = ""
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+                mock.stderr = ""
+            return mock
+
+        with patch("run_experiment.subprocess.run", side_effect=fake_run), \
+             patch("run_experiment.time.sleep"):
+            run_meta = run_experiment(
+                group="c", run_dir=self.run_dir, scenarios=["baseline", "s02"],
+                inter_scenario_gap=0.0, bifrost_url="http://x",
+            )
+
+        self.assertIn("fatal_error", run_meta)
+        self.assertEqual(run_meta["scenarios_succeeded"], [])
+        self.assertEqual(run_meta["scenarios_failed"], [])
+
+    def test_window_timestamps_are_ordered(self):
+        """end_ts must be >= start_ts for every scenario."""
+        from unittest.mock import patch
+        from run_experiment import run_experiment
+        from datetime import datetime
+        import json as _json
+
+        scenarios = ["baseline"]
+        outcomes = [(0, "ok")]
+
+        with patch("run_experiment.subprocess.run",
+                   side_effect=self._mock_subprocess_run_factory(outcomes)), \
+             patch("run_experiment.time.sleep"):
+            run_experiment(
+                group="c", run_dir=self.run_dir, scenarios=scenarios,
+                inter_scenario_gap=0.0, bifrost_url="http://x",
+            )
+
+        windows = _json.loads((self.run_dir / "windows.json").read_text())
+        w = windows["baseline"]
+        start = datetime.fromisoformat(w["start_ts"])
+        end = datetime.fromisoformat(w["end_ts"])
+        self.assertGreaterEqual(end, start)
+
+
+# ===================================================================
 # Run
 # ===================================================================
 
