@@ -995,6 +995,180 @@ class TestRunExperimentOrchestration(unittest.TestCase):
 
 
 # ===================================================================
+# Slice bifrost logs tests
+# ===================================================================
+
+class TestSliceBifrostLogs(unittest.TestCase):
+    """Tests for slice_bifrost_logs using a synthetic Bifrost DB + windows.json."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        import os
+        import json as _json
+        from pathlib import Path
+
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.run_dir = self.tmpdir / "run-001"
+        self.run_dir.mkdir()
+        self.db_path = self.tmpdir / "logs.db"
+
+        # Build synthetic Bifrost DB with 6 rows in 3 groups of 2
+        # Scenario 1: 21:00:00 and 21:00:01 (rows 1, 2)
+        # Scenario 2: 21:00:05 and 21:00:06 (rows 3, 4)
+        # Scenario 3: 21:00:10 and 21:00:11 (rows 5, 6)
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("""
+            CREATE TABLE mcp_tool_logs (
+                id INTEGER PRIMARY KEY,
+                request_id TEXT,
+                timestamp TEXT NOT NULL,
+                tool_name TEXT,
+                server_label TEXT,
+                arguments TEXT,
+                result TEXT,
+                error_details TEXT,
+                latency REAL,
+                status TEXT,
+                metadata TEXT,
+                created_at TEXT
+            )
+        """)
+        timestamps = [
+            "2026-05-01 21:00:00.0000000+00:00",  # row 1 -> baseline
+            "2026-05-01 21:00:01.0000000+00:00",  # row 2 -> baseline
+            "2026-05-01 21:00:05.0000000+00:00",  # row 3 -> s02
+            "2026-05-01 21:00:06.0000000+00:00",  # row 4 -> s02
+            "2026-05-01 21:00:10.0000000+00:00",  # row 5 -> s08
+            "2026-05-01 21:00:11.0000000+00:00",  # row 6 -> s08
+        ]
+        for i, ts in enumerate(timestamps, start=1):
+            conn.execute(
+                "INSERT INTO mcp_tool_logs (id, request_id, timestamp, tool_name, "
+                "server_label, arguments, result, latency, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (i, f"req-{i}", ts, "list_directory", "fs",
+                 '{"path":"/tmp"}', '{"content":[]}', 5.0, "success", ts),
+            )
+        conn.commit()
+        conn.close()
+
+        # Write a windows.json with 4 scenarios — one will produce empty,
+        # one will be marked failed
+        windows = {
+            "baseline": {
+                "start_ts": "2026-05-01T21:00:00+00:00",
+                "end_ts":   "2026-05-01T21:00:03+00:00",  # rows 1, 2
+                "status": "ok", "exit_code": 0,
+            },
+            "s02": {
+                "start_ts": "2026-05-01T21:00:05+00:00",
+                "end_ts":   "2026-05-01T21:00:08+00:00",  # rows 3, 4
+                "status": "ok", "exit_code": 0,
+            },
+            "s08": {
+                "start_ts": "2026-05-01T21:00:10+00:00",
+                "end_ts":   "2026-05-01T21:00:13+00:00",  # rows 5, 6
+                "status": "ok", "exit_code": 0,
+            },
+            "s_empty": {
+                "start_ts": "2027-01-01T00:00:00+00:00",
+                "end_ts":   "2027-01-02T00:00:00+00:00",  # no matches
+                "status": "ok", "exit_code": 0,
+            },
+            "s_failed": {
+                "start_ts": "2026-05-01T21:00:00+00:00",
+                "end_ts":   "2026-05-01T21:00:01+00:00",
+                "status": "failed", "exit_code": 1,
+            },
+        }
+        with open(self.run_dir / "windows.json", "w") as f:
+            _json.dump(windows, f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _read_jsonl(self, path):
+        import json as _json
+        with open(path) as f:
+            return [_json.loads(line) for line in f if line.strip()]
+
+    def test_slices_all_scenarios_with_correct_entry_counts(self):
+        from slice_bifrost_logs import slice_run
+        meta = slice_run(self.run_dir, self.db_path)
+
+        # baseline, s02, s08 each have 2 rows -> 4 entries (req+resp)
+        self.assertEqual(meta["scenarios"]["baseline"]["entries"], 4)
+        self.assertEqual(meta["scenarios"]["baseline"]["status"], "ok")
+        self.assertEqual(meta["scenarios"]["s02"]["entries"], 4)
+        self.assertEqual(meta["scenarios"]["s08"]["entries"], 4)
+
+        # Output files exist with correct contents
+        for sid in ("baseline", "s02", "s08"):
+            out_path = self.run_dir / f"group_b_{sid}.jsonl"
+            self.assertTrue(out_path.exists())
+            entries = self._read_jsonl(out_path)
+            self.assertEqual(len(entries), 4)
+
+    def test_skips_failed_scenarios(self):
+        from slice_bifrost_logs import slice_run
+        meta = slice_run(self.run_dir, self.db_path)
+
+        self.assertEqual(meta["scenarios"]["s_failed"]["status"],
+                         "skipped_failed_scenario")
+        # Output file should NOT exist for skipped scenarios
+        self.assertFalse((self.run_dir / "group_b_s_failed.jsonl").exists())
+
+    def test_empty_window_writes_empty_file(self):
+        from slice_bifrost_logs import slice_run
+        meta = slice_run(self.run_dir, self.db_path)
+
+        self.assertEqual(meta["scenarios"]["s_empty"]["status"], "ok_empty")
+        self.assertEqual(meta["scenarios"]["s_empty"]["entries"], 0)
+        # Empty file IS written (uniform downstream loop)
+        out_path = self.run_dir / "group_b_s_empty.jsonl"
+        self.assertTrue(out_path.exists())
+        self.assertEqual(out_path.stat().st_size, 0)
+
+    def test_missing_windows_json_raises(self):
+        from slice_bifrost_logs import slice_run
+        from pathlib import Path
+        empty_dir = self.tmpdir / "empty"
+        empty_dir.mkdir()
+        with self.assertRaises(FileNotFoundError):
+            slice_run(empty_dir, self.db_path)
+
+    def test_subset_scenarios(self):
+        """--scenarios should restrict the slice to listed IDs."""
+        from slice_bifrost_logs import slice_run
+        meta = slice_run(self.run_dir, self.db_path,
+                         scenarios=["baseline", "s02"])
+
+        self.assertEqual(set(meta["scenarios"].keys()), {"baseline", "s02"})
+        self.assertTrue((self.run_dir / "group_b_baseline.jsonl").exists())
+        self.assertTrue((self.run_dir / "group_b_s02.jsonl").exists())
+        # Other scenarios in windows.json should NOT be sliced
+        self.assertFalse((self.run_dir / "group_b_s08.jsonl").exists())
+
+    def test_unknown_scenario_in_subset_raises(self):
+        from slice_bifrost_logs import slice_run
+        with self.assertRaises(ValueError):
+            slice_run(self.run_dir, self.db_path,
+                      scenarios=["baseline", "s99_nonexistent"])
+
+    def test_slice_meta_written(self):
+        from slice_bifrost_logs import slice_run
+        import json as _json
+        slice_run(self.run_dir, self.db_path)
+        meta_path = self.run_dir / "slice_meta.json"
+        self.assertTrue(meta_path.exists())
+        meta = _json.loads(meta_path.read_text())
+        self.assertIn("scenarios", meta)
+        self.assertIn("sliced_at", meta)
+
+
+# ===================================================================
 # Run
 # ===================================================================
 
