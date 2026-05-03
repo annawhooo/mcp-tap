@@ -92,29 +92,17 @@ def adapt_bifrost(input_path: str, output_path: str, server_id: str = "bifrost",
         request_id = row["request_id"] or row["id"]
         latency = row["latency"]
 
-        # Parse arguments
-        args = None
-        if row["arguments"]:
-            try:
-                args = json.loads(row["arguments"])
-            except (json.JSONDecodeError, TypeError):
-                args = row["arguments"]
+        # Parse arguments. Bifrost double-encodes: the SQLite cell contains
+        # JSON whose `arguments` value is itself a JSON-encoded string.
+        # Decode both layers so downstream rules see a dict (matching the
+        # mcp-tap shape).
+        args = _parse_possibly_double_encoded(row["arguments"])
 
-        # Parse result
-        result = None
-        if row["result"]:
-            try:
-                result = json.loads(row["result"])
-            except (json.JSONDecodeError, TypeError):
-                result = row["result"]
+        # Parse result (same double-encoding pattern in some Bifrost versions)
+        result = _parse_possibly_double_encoded(row["result"])
 
         # Parse error
-        error = None
-        if row["error_details"]:
-            try:
-                error = json.loads(row["error_details"])
-            except (json.JSONDecodeError, TypeError):
-                error = row["error_details"]
+        error = _parse_possibly_double_encoded(row["error_details"])
 
         has_error = row["status"] == "error" or error is not None
 
@@ -225,6 +213,51 @@ def _parse_timestamp(ts: str):
         except ValueError:
             continue
     return None
+
+
+def _parse_possibly_double_encoded(value):
+    """Parse a value that may be JSON-encoded once or twice.
+
+    Bifrost stores tool call arguments (and sometimes results/errors) as
+    double-encoded JSON: the SQLite cell contains JSON, and the inner
+    `arguments` field within that JSON is itself a JSON-encoded string.
+
+    Without recursive parsing, downstream rules see `arguments` as a
+    string and skip the message (BIO-004a's gate `isinstance(args, dict)`
+    rejects strings). The mcp-tap capture path stores `arguments` as a
+    dict directly, so adapting Bifrost output requires the second parse.
+
+    Strategy: try to parse once. If the result is a string that looks
+    like JSON, parse again. Returns the most-decoded form.
+
+    Returns None if value is empty/None.
+    Returns the value as-is if parsing fails at any layer.
+    """
+    if not value:
+        return None
+    try:
+        first = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+    # If the parse yielded a string that itself looks like JSON, parse again
+    if isinstance(first, str) and first.strip().startswith(("{", "[", '"')):
+        try:
+            return json.loads(first)
+        except (json.JSONDecodeError, TypeError):
+            return first
+
+    # If first level is a dict, check whether any value is a JSON string
+    # that should be deserialized (Bifrost's pattern: outer dict has
+    # `arguments` as a stringified JSON object)
+    if isinstance(first, dict):
+        for k, v in list(first.items()):
+            if isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    first[k] = json.loads(v)
+                except (json.JSONDecodeError, TypeError):
+                    pass  # leave as-is if inner parse fails
+    return first
 
 
 def adapt_bifrost_json(input_path: str, output_path: str, server_id: str = "bifrost"):

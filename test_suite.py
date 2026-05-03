@@ -603,6 +603,65 @@ class TestParseTimestamp(unittest.TestCase):
         self.assertEqual(result.microsecond, 45546)
 
 
+class TestParsePossiblyDoubleEncoded(unittest.TestCase):
+    """Tests for double-encoded JSON handling.
+
+    Bifrost stores tool call arguments as a JSON-encoded string whose
+    inner content is itself a JSON-encoded string (double encoding).
+    Single-pass json.loads yields a string, not the dict downstream
+    rules expect.
+    """
+
+    def test_double_encoded_dict_returns_dict(self):
+        from log_adapter import _parse_possibly_double_encoded
+        # Bifrost's actual storage format
+        raw = '"{\\"path\\":\\"C:/data/foo.txt\\"}"'
+        result = _parse_possibly_double_encoded(raw)
+        self.assertEqual(result, {"path": "C:/data/foo.txt"})
+
+    def test_single_encoded_dict_returns_dict(self):
+        """Standard JSON-encoded dict (mcp-tap pattern) still works."""
+        from log_adapter import _parse_possibly_double_encoded
+        raw = '{"path":"C:/data/foo.txt"}'
+        result = _parse_possibly_double_encoded(raw)
+        self.assertEqual(result, {"path": "C:/data/foo.txt"})
+
+    def test_dict_with_inner_json_string_value_deserializes(self):
+        """Outer dict has a value that is itself a JSON-encoded string
+        (params containing stringified arguments). The inner string
+        should be parsed, replacing it with a dict in place."""
+        from log_adapter import _parse_possibly_double_encoded
+        raw = '{"name":"read_file","arguments":"{\\"path\\":\\"/x\\"}"}'
+        result = _parse_possibly_double_encoded(raw)
+        self.assertEqual(result["name"], "read_file")
+        self.assertEqual(result["arguments"], {"path": "/x"})
+
+    def test_empty_value_returns_none(self):
+        from log_adapter import _parse_possibly_double_encoded
+        self.assertIsNone(_parse_possibly_double_encoded(None))
+        self.assertIsNone(_parse_possibly_double_encoded(""))
+
+    def test_unparseable_returns_value_unchanged(self):
+        from log_adapter import _parse_possibly_double_encoded
+        result = _parse_possibly_double_encoded("not json at all")
+        self.assertEqual(result, "not json at all")
+
+    def test_inner_unparseable_string_left_unchanged(self):
+        """If the inner second-pass parse fails, leave the string as-is
+        rather than dropping it."""
+        from log_adapter import _parse_possibly_double_encoded
+        # Outer is valid JSON, but inner string is malformed JSON-looking
+        raw = '"{not valid json}"'
+        result = _parse_possibly_double_encoded(raw)
+        self.assertEqual(result, "{not valid json}")
+
+    def test_simple_string_not_starting_with_brace_returns_as_is(self):
+        from log_adapter import _parse_possibly_double_encoded
+        raw = '"just a regular string"'
+        result = _parse_possibly_double_encoded(raw)
+        self.assertEqual(result, "just a regular string")
+
+
 class TestAdaptBifrostWindowing(unittest.TestCase):
     """Tests for adapt_bifrost time-window filtering used by experiment slicer."""
 
@@ -1166,6 +1225,225 @@ class TestSliceBifrostLogs(unittest.TestCase):
         meta = _json.loads(meta_path.read_text())
         self.assertIn("scenarios", meta)
         self.assertIn("sliced_at", meta)
+
+
+# ===================================================================
+# Score results tests
+# ===================================================================
+
+class TestClassifyCell(unittest.TestCase):
+    """Tests for the (scenario, group, rule) cell classification."""
+
+    def setUp(self):
+        from score_results import classify_cell
+        self.classify = classify_cell
+        self.overrides = {
+            "BIO-001": ["b"],
+            "BIO-008": ["b"],
+            "CONV-005": ["b"],
+            "BIO-007": ["b", "c"],
+        }
+
+    def test_predicted_and_fired_returns_detected(self):
+        expected = {"count": 2, "severity": "CRITICAL", "reason": "honeytoken"}
+        status, _ = self.classify("BIO-004a", expected, 2, "c", self.overrides)
+        self.assertEqual(status, "DETECTED")
+
+    def test_predicted_and_silent_returns_rule_missed(self):
+        expected = {"count": 2, "severity": "CRITICAL", "reason": "honeytoken"}
+        status, _ = self.classify("BIO-004a", expected, 0, "c", self.overrides)
+        self.assertEqual(status, "RULE_MISSED")
+
+    def test_actual_under_expected_returns_rule_missed(self):
+        expected = {"count": 3, "severity": "MEDIUM", "reason": "glob"}
+        status, _ = self.classify("BIO-004a", expected, 1, "c", self.overrides)
+        self.assertEqual(status, "RULE_MISSED")
+
+    def test_actual_over_expected_returns_detected_with_note(self):
+        expected = {"count": 1, "severity": "any", "reason": "deviation"}
+        status, note = self.classify("BIO-003", expected, 5, "c", self.overrides)
+        self.assertEqual(status, "DETECTED")
+        self.assertIn("5", note)
+
+    def test_visibility_override_with_prediction_returns_data_missed(self):
+        """BIO-008 expected to fire but Group B can't observe → DATA_MISSED."""
+        expected = {"count": 1, "severity": "any", "reason": "schema change"}
+        status, _ = self.classify("BIO-008", expected, 0, "b", self.overrides)
+        self.assertEqual(status, "DATA_MISSED")
+
+    def test_visibility_override_no_prediction_returns_not_observable(self):
+        """BIO-001 not predicted on this scenario, Group B can't observe →
+        NOT_OBSERVABLE (architectural blind spot)."""
+        status, _ = self.classify("BIO-001", {}, 0, "b", self.overrides)
+        self.assertEqual(status, "NOT_OBSERVABLE")
+
+    def test_visibility_override_does_not_affect_other_group(self):
+        """BIO-008 in Group C is NOT overridden, behaves normally."""
+        expected = {"count": 1, "severity": "any", "reason": "schema change"}
+        status, _ = self.classify("BIO-008", expected, 1, "c", self.overrides)
+        self.assertEqual(status, "DETECTED")
+
+    def test_unexpected_firing_no_prediction(self):
+        status, note = self.classify("CONV-002", {}, 3, "c", self.overrides)
+        self.assertEqual(status, "UNEXPECTED_FIRING")
+        self.assertIn("3", note)
+
+    def test_not_expected_no_prediction_silent(self):
+        status, _ = self.classify("CONV-002", {}, 0, "c", self.overrides)
+        self.assertEqual(status, "NOT_EXPECTED")
+
+
+class TestCountFindingsByRule(unittest.TestCase):
+    def test_groups_by_rule_id(self):
+        from score_results import count_findings_by_rule
+        from mcp_detect import Finding
+        findings = [
+            Finding("BIO-004a", "bio-derived", "CRITICAL", "x", [], "s2"),
+            Finding("BIO-004a", "bio-derived", "CRITICAL", "y", [], "s2"),
+            Finding("BIO-003", "bio-derived", "any", "z", [], "s2"),
+        ]
+        counts = count_findings_by_rule(findings)
+        self.assertEqual(counts, {"BIO-004a": 2, "BIO-003": 1})
+
+    def test_empty_findings_returns_empty_dict(self):
+        from score_results import count_findings_by_rule
+        self.assertEqual(count_findings_by_rule([]), {})
+
+
+class TestScoreResultsIntegration(unittest.TestCase):
+    """End-to-end test: synthetic logs, expectations, full scoring pipeline."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.group_c = self.tmpdir / "run-c"
+        self.group_b = self.tmpdir / "run-b"
+        self.group_c.mkdir()
+        self.group_b.mkdir()
+        self.output = self.tmpdir / "results.csv"
+        self.expectations_path = self.tmpdir / "expectations.json"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_jsonl(self, path, entries):
+        import json as _json
+        with open(path, "w") as f:
+            for e in entries:
+                f.write(_json.dumps(e) + "\n")
+
+    def _make_honeytoken_call(self, msg_id, path, sequence):
+        """Build a minimal request+response pair for a honeytoken access."""
+        return [
+            {
+                "timestamp": f"2026-05-01T22:00:0{msg_id}.000+00:00",
+                "sequence": sequence,
+                "session_id": f"sess-{msg_id}",
+                "server_id": "filesystem",
+                "direction": "client_to_server",
+                "method": "tools/call",
+                "params": {"name": "read_text_file", "arguments": {"path": path}},
+                "message_id": str(msg_id),
+                "message_type": "request",
+            },
+            {
+                "timestamp": f"2026-05-01T22:00:0{msg_id}.001+00:00",
+                "sequence": sequence + 1,
+                "session_id": f"sess-{msg_id}",
+                "server_id": "filesystem",
+                "direction": "server_to_client",
+                "method": None,
+                "params": {"content": "data"},
+                "message_id": str(msg_id),
+                "message_type": "response",
+                "is_error": False,
+                "latency_ms": 1.0,
+            },
+        ]
+
+    def test_full_pipeline_with_synthetic_s02(self):
+        """Build a synthetic s02-like log, score it, verify DETECTED."""
+        from score_results import score_run
+        import json as _json
+
+        # Group C log: s02 reads two honeytokens
+        s02_entries = (
+            self._make_honeytoken_call(1, "/data/customer_export_2024.csv", 1)
+            + self._make_honeytoken_call(2, "/data/payroll_q3_draft.xlsx", 3)
+        )
+        self._write_jsonl(self.group_c / "group_c_s02.jsonl", s02_entries)
+        # Empty baseline for Group C (BIO-003 will produce findings on novel paths
+        # but that's an UNEXPECTED_FIRING in this synthetic scenario, not what
+        # we're testing — we just want to confirm BIO-004a fires correctly)
+        self._write_jsonl(self.group_c / "group_c_baseline.jsonl", [])
+        # Group B: write empty files so the pipeline doesn't error
+        self._write_jsonl(self.group_b / "group_b_s02.jsonl", [])
+        self._write_jsonl(self.group_b / "group_b_baseline.jsonl", [])
+
+        expectations = {
+            "_visibility_overrides": {
+                "BIO-001": ["b"], "BIO-008": ["b"],
+                "CONV-005": ["b"], "BIO-007": ["b", "c"],
+            },
+            "scenarios": {
+                "baseline": {"name": "baseline", "expected_firings": {}},
+                "s02": {
+                    "name": "s02",
+                    "expected_firings": {
+                        "BIO-004a": {"count": 2, "severity": "CRITICAL",
+                                     "reason": "honeytoken access"},
+                    },
+                },
+            },
+        }
+
+        rows = score_run(
+            self.group_c, self.group_b,
+            expectations,
+            ["customer_export_2024.csv", "payroll_q3_draft.xlsx"],
+        )
+
+        # Find the s02/BIO-004a row
+        s02_bio004a = [r for r in rows
+                       if r["scenario"] == "s02" and r["rule_id"] == "BIO-004a"]
+        self.assertEqual(len(s02_bio004a), 1)
+        row = s02_bio004a[0]
+        self.assertEqual(row["group_c_status"], "DETECTED")
+        self.assertEqual(row["group_c_count"], 2)
+        # Group B has empty log, so BIO-004a is RULE_MISSED there
+        self.assertEqual(row["group_b_status"], "RULE_MISSED")
+        self.assertEqual(row["group_b_count"], 0)
+
+    def test_visibility_override_on_real_file(self):
+        """BIO-001 should be NOT_OBSERVABLE in Group B even when no prediction."""
+        from score_results import score_run
+
+        self._write_jsonl(self.group_c / "group_c_baseline.jsonl", [])
+        self._write_jsonl(self.group_b / "group_b_baseline.jsonl", [])
+        self._write_jsonl(self.group_c / "group_c_s02.jsonl", [])
+        self._write_jsonl(self.group_b / "group_b_s02.jsonl", [])
+
+        expectations = {
+            "_visibility_overrides": {
+                "BIO-001": ["b"], "BIO-008": ["b"],
+                "CONV-005": ["b"], "BIO-007": ["b", "c"],
+            },
+            "scenarios": {
+                "baseline": {"name": "baseline", "expected_firings": {}},
+                "s02": {"name": "s02", "expected_firings": {}},
+            },
+        }
+
+        rows = score_run(self.group_c, self.group_b, expectations, [])
+
+        # No expected firings, no actual firings — but BIO-001 row exists
+        # because it's in visibility_overrides
+        s02_bio001 = [r for r in rows
+                      if r["scenario"] == "s02" and r["rule_id"] == "BIO-001"]
+        self.assertEqual(len(s02_bio001), 1)
+        self.assertEqual(s02_bio001[0]["group_b_status"], "NOT_OBSERVABLE")
 
 
 # ===================================================================
