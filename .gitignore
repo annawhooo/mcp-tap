@@ -26,3 +26,6 @@ experiment/check_all_logs.py
 experiment/do_commit*.bat
 experiment/run_*.bat
 experiment/test_*.bat
+  
+# PyCharm  
+.idea/  
