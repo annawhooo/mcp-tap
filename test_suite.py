@@ -12,7 +12,6 @@ Usage:
     python test_suite.py -v  (verbose)
 """
 
-import hashlib
 import json
 import os
 import sys
@@ -26,27 +25,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 from mcp_tap import (
     AuditLogger,
     classify_message,
-    compute_hmac,
     process_params,
 )
 from mcp_detect import (
-    Finding,
     bio_001_hmac_chain_integrity,
     bio_002_telemetry_gap,
     bio_003_behavioral_baseline_deviation,
     bio_004a_access,
-    bio_005_silence_detection,
-    bio_006_functional_output_monitoring,
     bio_008_tool_schema_change,
     bio_009_latency_anomaly,
     conv_001_failed_auth,
-    conv_002_volume_spike,
     conv_003_rapid_tool_calls,
     conv_004_credential_scope,
     conv_005_enumeration,
-    filter_messages,
-    read_jsonl,
-    run_rules,
 )
 
 
@@ -175,9 +166,9 @@ class TestHMACChain(unittest.TestCase):
         from mcp_tap import get_hmac_key
         logger = AuditLogger(self.tmp.name, "test", "full", get_hmac_key())
         logger.log_message("client_to_server",
-            '{"method": "tools/call", "params": {"name": "read_file"}, "id": 1}')
+                           '{"method": "tools/call", "params": {"name": "read_file"}, "id": 1}')
         logger.log_message("server_to_client",
-            '{"result": {"content": "data"}, "id": 1}')
+                           '{"result": {"content": "data"}, "id": 1}')
         logger.log_lifecycle("test_event")
         logger.close()
 
@@ -187,7 +178,7 @@ class TestHMACChain(unittest.TestCase):
         self.assertGreaterEqual(len(entries), 3)  # genesis + 2 messages + lifecycle
 
         for i in range(1, len(entries)):
-            self.assertEqual(entries[i]["prev_hmac"], entries[i-1]["hmac"],
+            self.assertEqual(entries[i]["prev_hmac"], entries[i - 1]["hmac"],
                              f"Chain broken at entry {i}")
 
     def test_session_id_present(self):
@@ -195,7 +186,7 @@ class TestHMACChain(unittest.TestCase):
         logger = AuditLogger(self.tmp.name, "test", "full", get_hmac_key(),
                              session_id="test-session")
         logger.log_message("client_to_server",
-            '{"method": "tools/list", "params": {}, "id": 1}')
+                           '{"method": "tools/list", "params": {}, "id": 1}')
         logger.close()
 
         with open(self.tmp.name) as f:
@@ -503,6 +494,142 @@ class TestBioDerivedRules(unittest.TestCase):
              "message_id": "2", "params": tools},
         ]
         findings = bio_008_tool_schema_change(messages)
+        self.assertEqual(len(findings), 0)
+
+    def test_bio_009_fires_on_per_method_shift(self):
+        # tools/call:read_file: 6 calls, latency doubles in second half
+        messages = []
+        for i in range(6):
+            latency = 10.0 if i < 3 else 25.0  # 150% shift, well over 50%
+            messages.append({
+                "message_type": "request",
+                "message_id": str(i),
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": f"/f{i}.txt"}},
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": str(i),
+                "latency_ms": latency,
+            })
+        findings = bio_009_latency_anomaly(messages)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule_id, "BIO-009")
+        self.assertIn("read_file", findings[0].description)
+
+
+    def test_bio_009_silent_on_stable_per_method_latency(self):
+        # tools/call:read_file: 6 calls, all 10ms — no shift
+        messages = []
+        for i in range(6):
+            messages.append({
+                "message_type": "request",
+                "message_id": str(i),
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": f"/f{i}.txt"}},
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": str(i),
+                "latency_ms": 10.0,
+            })
+        findings = bio_009_latency_anomaly(messages)
+        self.assertEqual(len(findings), 0)
+
+
+    def test_bio_009_does_not_aggregate_across_methods(self):
+        # Regression test for the original bug: a session that mixes cheap
+        # tools/list (low latency) with expensive tools/call (high latency)
+        # used to fire because everything was averaged together. Now that
+        # methods are segmented, this should NOT fire — neither tools/list
+        # nor tools/call individually has a within-method shift.
+        messages = []
+        # 4 tools/list calls at 5ms each (not in scope for the rule, but
+        # included to mimic the original failure scenario)
+        for i in range(4):
+            messages.append({
+                "message_type": "request",
+                "message_id": f"l{i}",
+                "method": "tools/list",
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": f"l{i}",
+                "latency_ms": 5.0,
+            })
+        # 4 tools/call:read_file at 50ms each (stable within method)
+        for i in range(4):
+            messages.append({
+                "message_type": "request",
+                "message_id": f"c{i}",
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": f"/f{i}.txt"}},
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": f"c{i}",
+                "latency_ms": 50.0,
+            })
+        findings = bio_009_latency_anomaly(messages)
+        self.assertEqual(len(findings), 0,
+                         "Aggregating across methods used to cause a false "
+                         "positive here; rule should now segment by method.")
+
+
+    def test_bio_009_separate_findings_per_tool(self):
+        # Two different tools both shift in the same session — expect two findings.
+        messages = []
+        # read_file: 4 calls, doubles
+        for i in range(4):
+            latency = 10.0 if i < 2 else 30.0
+            messages.append({
+                "message_type": "request",
+                "message_id": f"r{i}",
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": f"/f{i}.txt"}},
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": f"r{i}",
+                "latency_ms": latency,
+            })
+        # write_file: 4 calls, halves
+        for i in range(4):
+            latency = 100.0 if i < 2 else 30.0
+            messages.append({
+                "message_type": "request",
+                "message_id": f"w{i}",
+                "method": "tools/call",
+                "params": {"name": "write_file", "arguments": {"path": f"/f{i}.txt"}},
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": f"w{i}",
+                "latency_ms": latency,
+            })
+        findings = bio_009_latency_anomaly(messages)
+        self.assertEqual(len(findings), 2)
+        methods_in_findings = {f.description.split("'")[1] for f in findings}
+        self.assertEqual(methods_in_findings,
+                         {"tools/call:read_file", "tools/call:write_file"})
+
+
+    def test_bio_009_below_min_samples(self):
+        # Only 3 calls of a single tool — below BIO_009_MIN_SAMPLES_PER_METHOD.
+        messages = []
+        for i in range(3):
+            messages.append({
+                "message_type": "request",
+                "message_id": str(i),
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": f"/f{i}.txt"}},
+            })
+            messages.append({
+                "message_type": "response",
+                "message_id": str(i),
+                "latency_ms": 10.0 if i == 0 else 100.0,  # huge shift, but n too small
+            })
+        findings = bio_009_latency_anomaly(messages)
         self.assertEqual(len(findings), 0)
 
 
@@ -949,7 +1076,7 @@ class TestRunExperimentOrchestration(unittest.TestCase):
 
         with patch("run_experiment.subprocess.run",
                    side_effect=self._mock_subprocess_run_factory(outcomes)), \
-             patch("run_experiment.time.sleep"):
+                patch("run_experiment.time.sleep"):
             run_meta = run_experiment(
                 group="c", run_dir=self.run_dir, scenarios=scenarios,
                 inter_scenario_gap=0.0, bifrost_url="http://x",
@@ -986,7 +1113,7 @@ class TestRunExperimentOrchestration(unittest.TestCase):
 
         with patch("run_experiment.subprocess.run",
                    side_effect=self._mock_subprocess_run_factory(outcomes)), \
-             patch("run_experiment.time.sleep"):
+                patch("run_experiment.time.sleep"):
             run_meta = run_experiment(
                 group="c", run_dir=self.run_dir, scenarios=scenarios,
                 inter_scenario_gap=0.0, bifrost_url="http://x",
@@ -1018,7 +1145,7 @@ class TestRunExperimentOrchestration(unittest.TestCase):
             return mock
 
         with patch("run_experiment.subprocess.run", side_effect=fake_run), \
-             patch("run_experiment.time.sleep"):
+                patch("run_experiment.time.sleep"):
             run_meta = run_experiment(
                 group="c", run_dir=self.run_dir, scenarios=["baseline", "s02"],
                 inter_scenario_gap=0.0, bifrost_url="http://x",
@@ -1040,7 +1167,7 @@ class TestRunExperimentOrchestration(unittest.TestCase):
 
         with patch("run_experiment.subprocess.run",
                    side_effect=self._mock_subprocess_run_factory(outcomes)), \
-             patch("run_experiment.time.sleep"):
+                patch("run_experiment.time.sleep"):
             run_experiment(
                 group="c", run_dir=self.run_dir, scenarios=scenarios,
                 inter_scenario_gap=0.0, bifrost_url="http://x",
@@ -1063,7 +1190,6 @@ class TestSliceBifrostLogs(unittest.TestCase):
     def setUp(self):
         import sqlite3
         import tempfile
-        import os
         import json as _json
         from pathlib import Path
 
@@ -1117,27 +1243,27 @@ class TestSliceBifrostLogs(unittest.TestCase):
         windows = {
             "baseline": {
                 "start_ts": "2026-05-01T21:00:00+00:00",
-                "end_ts":   "2026-05-01T21:00:03+00:00",  # rows 1, 2
+                "end_ts": "2026-05-01T21:00:03+00:00",  # rows 1, 2
                 "status": "ok", "exit_code": 0,
             },
             "s02": {
                 "start_ts": "2026-05-01T21:00:05+00:00",
-                "end_ts":   "2026-05-01T21:00:08+00:00",  # rows 3, 4
+                "end_ts": "2026-05-01T21:00:08+00:00",  # rows 3, 4
                 "status": "ok", "exit_code": 0,
             },
             "s08": {
                 "start_ts": "2026-05-01T21:00:10+00:00",
-                "end_ts":   "2026-05-01T21:00:13+00:00",  # rows 5, 6
+                "end_ts": "2026-05-01T21:00:13+00:00",  # rows 5, 6
                 "status": "ok", "exit_code": 0,
             },
             "s_empty": {
                 "start_ts": "2027-01-01T00:00:00+00:00",
-                "end_ts":   "2027-01-02T00:00:00+00:00",  # no matches
+                "end_ts": "2027-01-02T00:00:00+00:00",  # no matches
                 "status": "ok", "exit_code": 0,
             },
             "s_failed": {
                 "start_ts": "2026-05-01T21:00:00+00:00",
-                "end_ts":   "2026-05-01T21:00:01+00:00",
+                "end_ts": "2026-05-01T21:00:01+00:00",
                 "status": "failed", "exit_code": 1,
             },
         }
@@ -1192,7 +1318,6 @@ class TestSliceBifrostLogs(unittest.TestCase):
 
     def test_missing_windows_json_raises(self):
         from slice_bifrost_logs import slice_run
-        from pathlib import Path
         empty_dir = self.tmpdir / "empty"
         empty_dir.mkdir()
         with self.assertRaises(FileNotFoundError):
@@ -1366,12 +1491,11 @@ class TestScoreResultsIntegration(unittest.TestCase):
     def test_full_pipeline_with_synthetic_s02(self):
         """Build a synthetic s02-like log, score it, verify DETECTED."""
         from score_results import score_run
-        import json as _json
 
         # Group C log: s02 reads two honeytokens
         s02_entries = (
-            self._make_honeytoken_call(1, "/data/customer_export_2024.csv", 1)
-            + self._make_honeytoken_call(2, "/data/payroll_q3_draft.xlsx", 3)
+                self._make_honeytoken_call(1, "/data/customer_export_2024.csv", 1)
+                + self._make_honeytoken_call(2, "/data/payroll_q3_draft.xlsx", 3)
         )
         self._write_jsonl(self.group_c / "group_c_s02.jsonl", s02_entries)
         # Empty baseline for Group C (BIO-003 will produce findings on novel paths
