@@ -130,7 +130,13 @@ def score_run(
     expected_rule_ids = set()
     for sdef in scenarios.values():
         expected_rule_ids.update(sdef.get("expected_firings", {}).keys())
-    expected_rule_ids.update(visibility_overrides.keys())
+    # Only pull actual rule IDs (CONV-* / BIO-*) from visibility_overrides.
+    # The JSON doc includes a "_comment" key alongside real rule keys, and
+    # without this filter it leaks into the output CSV as a spurious row.
+    expected_rule_ids.update(
+        k for k in visibility_overrides.keys()
+        if k.startswith("CONV-") or k.startswith("BIO-")
+    )
 
     # First pass: collect actual counts per scenario per group
     baseline_c = group_c_dir / "group_c_baseline.jsonl"
