@@ -146,6 +146,16 @@ def _acquire_log_lock(log_path: Path):
 
 HMAC_KEY_BYTES = 32  # 256 bits, matches SHA-256 block size
 
+# Cap on the per-stream relay buffer. JSON-RPC messages should never
+# approach this; typical MCP traffic is a few hundred KB at most.
+# A pathological or hostile server emitting an unbounded stream of bytes
+# without a parseable JSON terminator would otherwise cause buffer growth
+# without limit until OOM. On overflow we drop the buffer, emit a
+# 'relay_buffer_overflow' lifecycle event, and continue reading — the
+# wrapper survives, the audit log records the event, and downstream
+# detection rules can flag repeated overflows as their own signal.
+MAX_RELAY_BUFFER_BYTES = 16 * 1024 * 1024  # 16 MB
+
 
 def _load_key_file(key_path: Path) -> bytes:
     """Read and validate a hex-encoded key file. Raises SystemExit on invalid content."""
@@ -169,17 +179,87 @@ def _load_key_file(key_path: Path) -> bytes:
     return key
 
 
-def get_hmac_key() -> bytes:
+def _validate_production_keyfile(key_path: Path) -> None:
+    """
+    Strict checks for an HMAC keyfile in production mode.
+
+    Production mode requires the key to live somewhere the wrapped agent
+    cannot reach. We can't prove that mechanically, but we can catch the
+    obvious mistakes:
+      - Path under the user's home directory (the most common laptop default)
+      - Permissive file mode (only 0600 or tighter is acceptable on POSIX)
+    Anything else is allowed; production deployments are expected to mount
+    keys from /run/secrets, /var/run, or a similar isolated path.
+    """
+    resolved = key_path.resolve()
+    home = Path.home().resolve()
+    try:
+        if resolved.is_relative_to(home):
+            print(
+                f"mcp-tap: --production refuses HMAC keyfile under $HOME "
+                f"({resolved}). The agent runs as the same user and can read "
+                f"any file in $HOME. Mount the key from /run/secrets, a "
+                f"separate volume, or use MCP_TAP_HMAC_KEY from a secret "
+                f"manager. See docs/production-deployment.md.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    except AttributeError:
+        # Py 3.8 fallback
+        try:
+            resolved.relative_to(home)
+            under_home = True
+        except ValueError:
+            under_home = False
+        if under_home:
+            print(
+                f"mcp-tap: --production refuses HMAC keyfile under $HOME "
+                f"({resolved}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if os.name != "nt":
+        try:
+            mode = key_path.stat().st_mode & 0o777
+            if mode & 0o077:
+                print(
+                    f"mcp-tap: --production requires HMAC keyfile mode 0600 "
+                    f"or tighter; {key_path} has {oct(mode)}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except OSError as e:
+            print(f"mcp-tap: cannot stat HMAC keyfile {key_path}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+
+def get_hmac_key(production_mode: bool = False,
+                 keyfile: "Path | None" = None) -> bytes:
     """
     Retrieve or generate the HMAC key.
 
-    Priority:
+    Laptop mode (default) priority:
       1. MCP_TAP_HMAC_KEY environment variable (hex-encoded)
       2. ~/.mcp-tap-key file (hex-encoded, 600 on POSIX)
       3. Generate a new key and persist it to ~/.mcp-tap-key
 
-    For production: replace with OS keyring or external secret store.
+    Production mode (--production) priority:
+      1. --hmac-key-file PATH (must be outside $HOME, mode 0600)
+      2. MCP_TAP_HMAC_KEY environment variable
+      No fallback: production refuses to start without one of these.
+      Auto-generation to $HOME is disabled because the agent runs as the
+      same user and can read anything in $HOME.
+
+    For deployment: source MCP_TAP_HMAC_KEY from a secret manager (GCP
+    Secret Manager, AWS Secrets Manager, HashiCorp Vault) at startup.
     """
+    # Production mode: explicit keyfile path takes priority.
+    if production_mode and keyfile is not None:
+        _validate_production_keyfile(keyfile)
+        return _load_key_file(keyfile)
+
     env_key = os.environ.get("MCP_TAP_HMAC_KEY")
     if env_key:
         try:
@@ -199,6 +279,21 @@ def get_hmac_key() -> bytes:
             sys.exit(1)
         return key
 
+    if production_mode:
+        print(
+            "mcp-tap: --production refuses to start without an external HMAC "
+            "key. Provide one via:\n"
+            "  --hmac-key-file PATH  (path must be outside $HOME, mode 0600)\n"
+            "  MCP_TAP_HMAC_KEY env  (hex-encoded, sourced from a secret "
+            "manager)\n"
+            "Auto-generation to ~/.mcp-tap-key is disabled in production "
+            "mode because the agent runs as the same user and could read "
+            "the key. See docs/production-deployment.md.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Laptop mode fallback: keyfile in $HOME, auto-generate if missing.
     key_path = Path.home() / ".mcp-tap-key"
     if key_path.exists():
         # Best-effort warning if the key file is readable by others on POSIX.
@@ -392,8 +487,17 @@ class AuditLogger:
         # Exits if another mcp-tap is already writing this file.
         self._lock_file = _acquire_log_lock(self.log_path)
 
-        # Open persistent file handle (avoids per-write open/close overhead)
-        self._log_file = open(self.log_path, "a", encoding="utf-8")
+        # Open persistent file handle (avoids per-write open/close overhead).
+        # Atomic create-with-mode 0600 so the file is never world-readable,
+        # even briefly, on multi-user hosts. POSIX honors the mode argument;
+        # on Windows the third argument is ignored and ACL inheritance applies.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        # On Windows, also set O_BINARY-equivalent semantics via os.open's
+        # default text translation off. Python opens with default umask
+        # masking applied to the mode; explicit 0o600 keeps it tight even
+        # if the user's umask is loose.
+        fd = os.open(self.log_path, flags, 0o600)
+        self._log_file = os.fdopen(fd, "a", encoding="utf-8")
 
         # Write genesis entry
         self._write_entry({
@@ -559,6 +663,22 @@ def relay_stream(
 
             buffer += chunk
 
+            # Buffer cap: a server that streams unparseable bytes without
+            # a JSON terminator would otherwise grow the buffer without
+            # bound. On overflow, drop the buffer, log a lifecycle event,
+            # and continue reading. The wrapper survives a misbehaving
+            # server; the audit log records the overflow event so a
+            # detection rule can flag it.
+            if len(buffer) > MAX_RELAY_BUFFER_BYTES:
+                logger.log_lifecycle("relay_buffer_overflow", {
+                    "direction": direction,
+                    "dropped_bytes": len(buffer),
+                    "cap": MAX_RELAY_BUFFER_BYTES,
+                })
+                buffer = b""
+                # Skip parsing this round; resume reading on next iteration.
+                continue
+
             # Try to parse complete JSON objects from the buffer.
             # Fast path: most MCP servers send one JSON per line.
             # Slow path: accumulate until valid JSON is found.
@@ -708,46 +828,159 @@ def main():
              "multiple mcp-tap instances in the same experiment run. "
              "If not provided, a random ID is generated.",
     )
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Enable production deployment posture. Refuses to start without "
+             "an external HMAC key (MCP_TAP_HMAC_KEY env or --hmac-key-file "
+             "outside $HOME), requires explicit --server-scope, and forces "
+             "sensitivity to 'redact' or stricter. The shipped tool is the "
+             "reference implementation for laptop use; --production makes "
+             "the deployment posture described in the paper demonstrable in "
+             "code. See docs/production-deployment.md.",
+    )
+    parser.add_argument(
+        "--hmac-key-file",
+        type=Path,
+        default=None,
+        help="Path to a file containing the hex-encoded HMAC key. In "
+             "--production mode the path MUST be outside $HOME and the file "
+             "MUST be mode 0600 or tighter on POSIX.",
+    )
+    parser.add_argument(
+        "--server-scope",
+        type=Path,
+        default=None,
+        help="Directory the wrapped server is allowed to access. Used to "
+             "verify the audit log lives outside that scope. Required in "
+             "--production mode; in laptop mode, falls back to the "
+             "best-effort heuristic that scans the --server command for a "
+             "trailing path argument.",
+    )
 
     args = parser.parse_args()
 
-    # Validate log path is not inside an agent-accessible directory
-    log_path = Path(args.log).resolve()
-
-    # Extract the server's working directory from the command
-    # (heuristic: last argument that looks like a path)
-    # Uses Path.is_relative_to (Py 3.9+) rather than string-prefix matching,
-    # which would match `/foo/barbaz` against `/foo/bar`.
-    server_parts = args.server.split()
-    for part in reversed(server_parts):
-        try:
-            resolved = Path(part).resolve()
-        except (OSError, ValueError):
-            continue
-        if not resolved.is_dir():
-            continue
-        try:
-            contained = log_path.is_relative_to(resolved)
-        except AttributeError:
-            # Py 3.8 fallback (is_relative_to added in 3.9).
-            try:
-                log_path.relative_to(resolved)
-                contained = True
-            except ValueError:
-                contained = False
-        if contained:
+    # ---- Production-mode validation ----
+    # Order matters: validate the request before doing any I/O so failures
+    # are clean refusals to start, not partial state on disk.
+    if args.production:
+        # Force minimum sensitivity: redact-or-stricter.
+        # 'full' logs plaintext credentials; that's wrong posture for any
+        # deployment whose logs ship off-host.
+        if args.sensitivity == "full":
             print(
-                f"mcp-tap: REFUSING to start. Log path ({log_path}) "
-                f"is inside the server's directory ({resolved}). "
-                f"An agent with filesystem access could tamper with the log. "
-                f"Use a log path OUTSIDE the server's scope.",
+                "mcp-tap: --production forces --sensitivity to at least "
+                "'redact' (was 'full'). Plaintext credentials must not "
+                "land in audit logs that ship off-host. Re-run with "
+                "--sensitivity redact / hash / metadata.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        break
+
+        # --server-scope is required in production. The laptop heuristic
+        # (scan --server for a trailing path) fails open in too many
+        # configurations to rely on for a deployment posture.
+        if args.server_scope is None:
+            print(
+                "mcp-tap: --production requires --server-scope PATH. "
+                "Name the directory the wrapped server is allowed to "
+                "access; mcp-tap will verify the audit log lives outside "
+                "that scope before starting.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Validate log path is not inside an agent-accessible directory.
+    log_path = Path(args.log).resolve()
+
+    # Server scope: explicit --server-scope wins (required in production,
+    # optional in laptop). Without it, fall back to the heuristic that
+    # scans the --server command for a trailing path argument.
+    explicit_scope: "Path | None" = None
+    if args.server_scope is not None:
+        try:
+            explicit_scope = args.server_scope.resolve()
+        except (OSError, ValueError) as e:
+            print(f"mcp-tap: cannot resolve --server-scope "
+                  f"({args.server_scope}): {e}", file=sys.stderr)
+            sys.exit(1)
+        if not explicit_scope.is_dir():
+            print(f"mcp-tap: --server-scope ({explicit_scope}) is not an "
+                  f"existing directory.", file=sys.stderr)
+            sys.exit(1)
+
+    def _log_inside(scope: Path) -> bool:
+        """True if log_path is inside `scope`."""
+        try:
+            return log_path.is_relative_to(scope)
+        except AttributeError:
+            try:
+                log_path.relative_to(scope)
+                return True
+            except ValueError:
+                return False
+
+    if explicit_scope is not None:
+        # Explicit scope: hard check, fail closed if log_path is inside.
+        if _log_inside(explicit_scope):
+            print(
+                f"mcp-tap: REFUSING to start. Log path ({log_path}) is "
+                f"inside --server-scope ({explicit_scope}). An agent with "
+                f"filesystem access could tamper with the log.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif args.production:
+        # Unreachable: production validation above already required scope.
+        # Belt-and-suspenders — keep this so a future change doesn't
+        # silently relax the production posture.
+        print("mcp-tap: --production requires --server-scope.",
+              file=sys.stderr)
+        sys.exit(1)
+    else:
+        # Laptop mode, no explicit scope: best-effort heuristic.
+        # Scan --server (whitespace split — accepted as a known limitation
+        # of laptop mode; production users provide --server-scope).
+        scope_inferred = False
+        server_parts = args.server.split()
+        for part in reversed(server_parts):
+            try:
+                resolved = Path(part).resolve()
+            except (OSError, ValueError):
+                continue
+            if not resolved.is_dir():
+                continue
+            scope_inferred = True
+            if _log_inside(resolved):
+                print(
+                    f"mcp-tap: REFUSING to start. Log path ({log_path}) "
+                    f"is inside the inferred server directory ({resolved}). "
+                    f"Use a log path OUTSIDE the server's scope, or pass "
+                    f"--server-scope explicitly.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            break
+
+        if not scope_inferred:
+            # Fail-open prevention: warn loudly so the user knows the
+            # safeguard didn't engage. Laptop mode does not refuse to
+            # start here (that would break too many existing setups);
+            # production mode would have already exited above.
+            print(
+                "mcp-tap: warning: could not infer server scope from "
+                "--server command. The log-path tamper check did not "
+                "engage. If the log path is inside the server's accessible "
+                "directory, an agent could tamper with it. Pass "
+                "--server-scope PATH to make this check explicit.",
+                file=sys.stderr,
+            )
 
     # Initialize HMAC key
-    hmac_key = get_hmac_key()
+    hmac_key = get_hmac_key(
+        production_mode=args.production,
+        keyfile=args.hmac_key_file,
+    )
 
     # Initialize logger
     logger = AuditLogger(
@@ -757,6 +990,15 @@ def main():
         hmac_key=hmac_key,
         session_id=args.session_id,
     )
+
+    # Record startup posture in the audit log so readers can tell which
+    # mode produced this log. lifecycle entries chain into the HMAC like
+    # everything else, so this is tamper-evident.
+    logger.log_lifecycle("startup_posture", {
+        "production_mode": bool(args.production),
+        "explicit_server_scope": str(explicit_scope) if explicit_scope else None,
+        "sensitivity": args.sensitivity,
+    })
 
     # Parse and spawn the server
     server_cmd = parse_server_command(args.server)

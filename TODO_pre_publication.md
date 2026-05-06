@@ -2,6 +2,26 @@
 
 Items that must be completed before publishing or presenting at a conference.
 
+## Methods Section: Binarization Pre-Registration (PRIMARY)
+
+The 5-state outcome taxonomy (DETECTED, UNEXPECTED_FIRING, RULE_MISSED, DATA_MISSED, NOT_OBSERVABLE, NOT_EXPECTED) flows end-to-end from `score_results.py` through `aggregate_results.py` to `analyze.py`. The statistical tests (Cochran's Q, McNemar's exact) require binary outcomes, so a binarization step is unavoidable. Two specifications were considered:
+
+- **Strict (PRE-REGISTERED PRIMARY):** Only the `DETECTED` state counts as 1; all other states (including `UNEXPECTED_FIRING`) count as 0.
+- **Lenient (SENSITIVITY):** `DETECTED` and `UNEXPECTED_FIRING` both count as 1; remaining failure states count as 0.
+
+**The strict specification was pre-registered as primary before any real-data analysis output was viewed.**
+
+Rationale (verbatim from the `_detected` docstring in `analyze.py`, the durable record of the pre-registration):
+
+> The experiment tests whether *predicted* detection mechanisms fire as predicted, not whether the system flags the scenario by any means. The experiment's prediction file (`scenario-expectations.json`) names which rules should fire on which scenarios. Strict binarization is consistent with that. UNEXPECTED_FIRING is a separate signal preserved end-to-end through the 5-state taxonomy. Counting it as DETECTED would conflate "we got what we expected" with "we got something else useful." Both are interesting; they're different findings.
+
+**Reporting plan for the paper:**
+1. Run `python analyze.py --results <factorial.csv>` for the primary strict analysis. This is the headline result.
+2. Run `python analyze.py --results <factorial.csv> --lenient` as a sensitivity check. Report this in an appendix or sensitivity-analysis subsection.
+3. The output of both runs starts with a `=== Binarization mode: ... ===` banner so saved logs are self-identifying.
+
+**Why this matters:** Choosing strict vs lenient *after* seeing real-data output would be HARKing — picking the framing that fits whichever specification produced a more favorable result. Pre-registering primary + reporting sensitivity in parallel is the standard defense against that pattern.
+
 ## Detection Rule Family Expansions
 
 ### BIO-004 family (honeytoken detection)

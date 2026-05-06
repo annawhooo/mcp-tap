@@ -754,66 +754,110 @@ def bio_008_tool_schema_change(messages: list[dict]) -> list[Finding]:
     return findings
 
 
+# Constants — pulled out of the function body so they're visible and tunable
+# without diving into the rule. These are starting heuristics, not tuned
+# values; if a deployment produces noise, raise the threshold rather than
+# editing the rule logic.
+BIO_009_MIN_SAMPLES_PER_METHOD = 4
+BIO_009_LATENCY_SHIFT_THRESHOLD = 0.5  # 50% relative change between halves
+ 
+ 
 def bio_009_latency_anomaly(messages: list[dict]) -> list[Finding]:
     """
-    BIO-009: Latency anomaly detection.
+    BIO-009: Latency anomaly detection (per-method).
     Principle: #25 (Behavioral continuity). Scenario: #22 (Tool Substitution).
-
-    If a tool's response latency changes significantly, the tool may have
-    been replaced with a different implementation. A shadow tool will have
-    different performance characteristics than the original.
-
-    Latencies are grouped by the originating request's method (and, for
-    tools/call, by tool name) so that a shift in *one* tool isn't diluted
-    by unrelated traffic.
+ 
+    For each tools/call method observed in the session, compare the average
+    response latency of the first half of its calls against the second half.
+    If the relative change exceeds BIO_009_LATENCY_SHIFT_THRESHOLD, emit a
+    finding. A shadow tool replacing the real one will typically have
+    different performance characteristics than the original; that shift is
+    what this rule looks for.
+ 
+    Scoping: only tools/call methods are evaluated. System methods
+    (initialize, tools/list, notifications/*) are excluded because their
+    latency profile reflects MCP framing rather than tool implementation,
+    and including them dilutes the signal the rule is named for.
+ 
+    Minimum sample size per method is BIO_009_MIN_SAMPLES_PER_METHOD; below
+    that, first/second-half splits are statistically meaningless.
     """
     findings = []
-
-    # Build a map: message_id -> key describing what was called.
-    # For tools/call we use "tools/call:<tool_name>" so different tools
-    # are tracked independently.
-    key_by_id: dict[str, str] = {}
+ 
+    # Step 1: build message_id -> method map from requests, mirroring the
+    # pattern in bio_006_functional_output_monitoring. Only tools/call
+    # methods are tracked; other methods are not in scope for this rule.
+    request_methods: dict[str, str] = {}
     for m in messages:
-        if m.get("message_type") != "request" or not m.get("message_id"):
-            continue
-        method = m.get("method") or "unknown"
-        key = method
-        if method == "tools/call":
-            p = m.get("params")
-            if isinstance(p, dict):
-                tool_name = p.get("name")
-                if tool_name:
-                    key = f"tools/call:{tool_name}"
-        key_by_id[str(m["message_id"])] = key
-
-    latencies_by_key: dict[str, list[float]] = defaultdict(list)
+        if (m.get("message_type") == "request"
+                and m.get("message_id")
+                and m.get("method") == "tools/call"):
+            # For tools/call, the actual tool name is in params.name.
+            # Use the tool name where available so substitution of a
+            # specific tool is visible; fall back to "tools/call" if the
+            # name can't be extracted.
+            params = m.get("params") or {}
+            tool_name = params.get("name") if isinstance(params, dict) else None
+            request_methods[str(m["message_id"])] = (
+                f"tools/call:{tool_name}" if tool_name else "tools/call"
+            )
+ 
+    # Step 2: group response latencies by the originating method/tool.
+    # Latency is set on the response message by mcp_tap.AuditLogger when
+    # a request/response pair is matched (see mcp_tap.py:235–242).
+    latencies_by_method: dict[str, list[tuple[float, dict]]] = defaultdict(list)
     for m in messages:
-        lat = m.get("latency_ms")
-        if lat is None or not m.get("message_id"):
+        if (m.get("message_type") == "response"
+                and m.get("latency_ms") is not None
+                and m.get("message_id")):
+            method = request_methods.get(str(m["message_id"]))
+            if method is None:
+                # Response we have no recorded request for — skip rather
+                # than dump into a catch-all bucket. The orphan-response
+                # signal is BIO-002's job, not this rule's.
+                continue
+            latencies_by_method[method].append((m.get("latency_ms"), m))
+ 
+    # Step 3: for each method with enough samples, compare halves and
+    # emit a finding if the shift exceeds the threshold.
+    for method, lat_pairs in latencies_by_method.items():
+        if len(lat_pairs) < BIO_009_MIN_SAMPLES_PER_METHOD:
             continue
-        key = key_by_id.get(str(m["message_id"]))
-        if key is None:
-            continue
-        latencies_by_key[key].append(lat)
-
-    for key, lats in latencies_by_key.items():
-        if len(lats) < 4:
-            continue
+ 
+        lats = [pair[0] for pair in lat_pairs]
+        msgs = [pair[1] for pair in lat_pairs]
+ 
         mid = len(lats) // 2
-        first_avg = sum(lats[:mid]) / mid
-        second_avg = sum(lats[mid:]) / (len(lats) - mid)
+        first_half = lats[:mid]
+        second_half = lats[mid:]
+ 
+        first_avg = sum(first_half) / len(first_half)
+        second_avg = sum(second_half) / len(second_half)
+ 
         if first_avg <= 0:
+            # Avoid division by zero or negative averages (shouldn't happen
+            # with real latency data, but be defensive).
             continue
-        change = abs(second_avg - first_avg) / first_avg
-        if change > 0.5:
+ 
+        rel_change = abs(second_avg - first_avg) / first_avg
+        if rel_change > BIO_009_LATENCY_SHIFT_THRESHOLD:
+            # Evidence: include the boundary samples — the last call of the
+            # first half and the first call of the second half. That's where
+            # the substitution would have happened if there is one.
+            evidence = []
+            if mid > 0 and mid < len(msgs):
+                evidence = [msgs[mid - 1], msgs[mid]]
             findings.append(Finding(
                 rule_id="BIO-009",
                 rule_set="bio-derived",
                 severity="MEDIUM",
-                description=f"Latency shift for {key}: first half avg={first_avg:.1f}ms, "
-                            f"second half avg={second_avg:.1f}ms "
-                            f"({change * 100:.0f}% change, n={len(lats)})",
-                evidence=[],
+                description=(
+                    f"Latency shift in '{method}': "
+                    f"first half avg={first_avg:.1f}ms (n={len(first_half)}), "
+                    f"second half avg={second_avg:.1f}ms (n={len(second_half)}), "
+                    f"{rel_change * 100:.0f}% change"
+                ),
+                evidence=evidence,
                 scenario="#22 Tool Substitution",
             ))
     return findings
