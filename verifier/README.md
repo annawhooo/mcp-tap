@@ -136,10 +136,57 @@ The verifier reports all breaks, not just the first. A run with multiple breaks 
 
 The verifier runs locally by default. For compliance-grade evidence (e.g. state AG proceedings), running it from a dedicated service identity on GCE/GKE/Cloud Run gives stronger provenance than running it from a laptop. The verifier code is identical in either case — the deployment is the difference.
 
-Phase (c) (planned) will add JSON sidecar output and an evidence-bundle tarball suitable for compliance handoff.
+## Compliance output: JSON sidecar and evidence bundle
+
+For compliance handoff (e.g. state AG proceedings), the verifier can emit two additional outputs beyond the stdout text summary:
+
+### JSON sidecar (`--output-json PATH`)
+
+A structured verification record containing everything a downstream party needs to independently re-verify the chain. Fields include:
+
+- `verifier_version`, `verification_timestamp_utc`
+- `source`, `source_type` (local or GCS)
+- `key_source` (human-readable label for which secret backend was used)
+- `key_fingerprint_sha256` — SHA-256 of the HMAC key, hex-encoded. **The key itself is never included.** This proves "the same key was used" without revealing the key.
+- `algorithm` (HMAC-SHA256)
+- `canonicalization` — exact rules: `json.dumps with sort_keys=True, separators=(",", ":")`, UTF-8 encoding, hmac field set to empty string before computation, genesis sentinel string `"genesis"`, sequence starts at 1
+- `result` (PASS or FAIL), `records_verified`, `first_sequence`, `last_sequence`, `last_hmac`
+- `breaks` — full list with kind, record_index, sequence, object_name, expected, actual, detail
+
+### Evidence bundle (`--evidence-bundle PATH`)
+
+A tar.gz archive suitable for handoff to non-technical reviewers. Contents:
+
+```
+evidence-bundle/
+├── README.txt              Explanation of bundle contents and how to re-verify
+├── verification.json       Same structure as --output-json
+├── summary.txt             Human-readable PASS/FAIL summary
+└── samples/
+    ├── first-records.jsonl   First N records from the chain, verbatim
+    └── last-records.jsonl    Last N records from the chain, verbatim
+```
+
+Each sample record has a `_source_object` field appended so the reviewer can correlate back to its source GCS object (or local file path).
+
+Use `--bundle-sample-count N` to control how many records are included from each end (default: 10). Memory cost is bounded at 2N records regardless of total chain length.
+
+### Example: produce both outputs
+
+```powershell
+python -m verifier.verify `
+    --gcs gs://privacy-links-audit/2026/ `
+    --key-source gcp-secret-manager `
+    --secret-name mcp-tap-hmac-key `
+    --output-json C:\evidence\verification.json `
+    --evidence-bundle C:\evidence\bundle.tar.gz `
+    --bundle-sample-count 25
+```
+
+This writes the same verification.json both as a standalone file (for scripting / downstream tools) and embedded in the tarball (for compliance handoff).
 
 ## Phase status
 
-- **(a) MVP**: this version. Local + GCS sources, 6 key sources, text PASS/FAIL output.
+- **(a) MVP**: local + GCS sources, 6 key sources, text PASS/FAIL output.
 - **(b) Adversarial tests**: deliberate corruption fixtures exercising every break kind.
-- **(c) Compliance output**: JSON sidecar + evidence-bundle tarball.
+- **(c) Compliance output**: JSON sidecar (`--output-json`) and evidence-bundle tarball (`--evidence-bundle`) for handoff to non-technical reviewers.

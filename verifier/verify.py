@@ -20,6 +20,7 @@ from typing import Optional
 from . import chain
 from . import key_sources
 from . import readers
+from . import report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +85,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-var", default="MCP_TAP_HMAC_KEY",
                         help="Env var name for --key-source env")
     parser.add_argument("--key-file", help="File path for --key-source file")
+
+    # Output options
+    parser.add_argument(
+        "--output-json",
+        metavar="PATH",
+        help="Write structured verification record (JSON) to PATH. Contains "
+             "all parameters needed for downstream re-verification: source, "
+             "key fingerprint (SHA-256 of key, not key itself), algorithm, "
+             "canonicalization, result, breaks list.",
+    )
+    parser.add_argument(
+        "--evidence-bundle",
+        metavar="PATH",
+        help="Write compliance-grade evidence bundle (tar.gz) to PATH. "
+             "Contains verification.json, summary.txt, first/last N sample "
+             "records, and a README. Suitable for handoff to non-technical "
+             "reviewers (e.g. state AG proceedings).",
+    )
+    parser.add_argument(
+        "--bundle-sample-count",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of records to include from each of the first and last "
+             "of the chain in the evidence bundle (default: 10). Memory is "
+             "bounded at 2N regardless of chain length.",
+    )
 
     return parser
 
@@ -156,46 +184,6 @@ def build_key_source(args) -> key_sources.KeySource:
     raise SystemExit(f"verifier: unknown key source {src!r}")
 
 
-def print_text_report(
-    source_label: str,
-    key_source_label: str,
-    result: chain.VerificationResult,
-) -> None:
-    """Print a human-readable PASS/FAIL summary to stdout.
-
-    Phase (c) will add JSON sidecar and evidence-bundle output. This MVP
-    text output is enough for engineer-facing verification.
-    """
-    print("=" * 70)
-    print("mcp-tap verifier")
-    print("=" * 70)
-    print(f"Source:       {source_label}")
-    print(f"Key source:   {key_source_label}")
-    print(f"Records:      {result.records_verified}")
-    if result.first_sequence is not None:
-        print(
-            f"Seq range:    {result.first_sequence} -> {result.last_sequence}"
-        )
-    print(f"Last HMAC:    {result.last_hmac}")
-    print("-" * 70)
-
-    if result.is_valid:
-        print("RESULT: PASS — chain integrity verified")
-        return
-
-    print(f"RESULT: FAIL — {len(result.breaks)} chain break(s) detected")
-    print()
-    for i, b in enumerate(result.breaks, start=1):
-        print(f"Break {i}: {b.kind.value}")
-        print(f"  record_index: {b.record_index}")
-        print(f"  sequence:     {b.sequence}")
-        print(f"  object:       {b.object_name}")
-        print(f"  expected:     {b.expected}")
-        print(f"  actual:       {b.actual}")
-        print(f"  detail:       {b.detail}")
-        print()
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -209,15 +197,32 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Stream records from the chosen source
     if args.local:
-        records = readers.stream_records_local(args.local)
+        raw_records = readers.stream_records_local(args.local)
         source_label = f"local:{args.local}"
+        source_type = "local"
     else:
         try:
-            records = readers.stream_records_gcs(args.gcs, project=args.project)
+            raw_records = readers.stream_records_gcs(
+                args.gcs, project=args.project
+            )
         except (ValueError, RuntimeError) as e:
             print(f"verifier: GCS source error: {e}", file=sys.stderr)
             return 2
         source_label = args.gcs
+        source_type = "gcs"
+
+    # Wrap in sampling iterator only when we need samples for the bundle.
+    # Memory cost: bounded at 2 * bundle_sample_count records.
+    sampled: Optional[report.SamplingIterator] = None
+    if args.evidence_bundle:
+        sampled = report.SamplingIterator(
+            raw_records,
+            first_n=args.bundle_sample_count,
+            last_n=args.bundle_sample_count,
+        )
+        records = sampled
+    else:
+        records = raw_records
 
     # Verify
     try:
@@ -229,7 +234,56 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"verifier: error while reading records: {e}", file=sys.stderr)
         return 2
 
-    print_text_report(source_label, key_src.describe(), result)
+    # Build verification metadata used for stdout, JSON sidecar, and bundle
+    invocation_args = sys.argv[1:] if argv is None else list(argv)
+    metadata = report.build_verification_metadata(
+        source_label=source_label,
+        source_type=source_type,
+        key_source_label=key_src.describe(),
+        key=key,
+        result=result,
+        invocation_args=invocation_args,
+    )
+
+    # Human-readable summary to stdout (always)
+    print(report.format_summary_text(metadata), end="")
+
+    # Optional JSON sidecar
+    if args.output_json:
+        try:
+            report.write_json_sidecar(metadata, args.output_json)
+            print(
+                f"JSON sidecar written: {args.output_json}",
+                file=sys.stderr,
+            )
+        except OSError as e:
+            print(
+                f"verifier: failed to write JSON sidecar: {e}",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Optional evidence bundle
+    if args.evidence_bundle:
+        try:
+            report.write_evidence_bundle(
+                metadata=metadata,
+                first_samples=sampled.first_samples if sampled else [],
+                last_samples=sampled.last_samples if sampled else [],
+                summary_text=report.format_summary_text(metadata),
+                path=args.evidence_bundle,
+            )
+            print(
+                f"Evidence bundle written: {args.evidence_bundle}",
+                file=sys.stderr,
+            )
+        except OSError as e:
+            print(
+                f"verifier: failed to write evidence bundle: {e}",
+                file=sys.stderr,
+            )
+            return 2
+
     return 0 if result.is_valid else 1
 
 
