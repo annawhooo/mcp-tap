@@ -158,6 +158,30 @@ The paper is available at: https://doi.org/10.5281/zenodo.19393455
 | ToolHive | Container-native gateway, K8s RBAC | HTTP |
 | coffer-mcp | Encrypted credential vault with self-reported audit | stdio |
 
+## AARM Alignment
+
+mcp-tap is aligned with the [Autonomous Action Runtime Management (AARM) specification](https://aarm.dev), an open specification for securing AI-driven actions at runtime, stewarded by the CSAI Foundation.
+
+mcp-tap addresses three of the AARM [system components](https://aarm.dev/components/overview):
+
+- **Action Mediation Layer:** intercepts MCP tool calls at the stdio transport layer
+- **Context Accumulator:** maintains a tamper-evident, HMAC-chained log of every action and its surrounding context
+- **Receipt Generator:** each log entry is a cryptographically chained receipt binding the action, message ID, sequence, and timing
+
+mcp-tap is a passive observer, not a pre-execution enforcement point. It captures and preserves evidence of agent actions for forensic analysis and compliance audit. AARM-Conformant systems require pre-execution interception with policy evaluation and one of five authorization decisions (allow, deny, modify, step-up, defer). mcp-tap is positioned as **AARM-Aligned** rather than AARM-Conformant.
+
+For pre-execution enforcement on HTTP-transport MCP servers, mcp-tap is designed to interoperate with active gateways (Bifrost, ToolHive, MintMCP), leaving mcp-tap to cover the stdio transport that other gateways do not.
+
+The companion tool [coffer-mcp](https://github.com/annawhooo/coffer-mcp) addresses the AARM [Over-Privileged Credentials threat](https://aarm.dev/threats/over-privileged-credentials) by ensuring credentials are resolved server-side and never enter the LLM context.
+
+## Issues and Security
+
+For bug reports and feature requests, use [GitHub Issues](https://github.com/annawhooo/mcp-tap/issues).
+
+For security vulnerabilities, report privately via [GitHub Security Advisories](https://github.com/annawhooo/mcp-tap/security/advisories/new). Do not open a public issue for security reports.
+
+mcp-tap is a single-maintainer research project. Response times are best-effort, not an SLA.
+
 ## License
 
 Apache 2.0
