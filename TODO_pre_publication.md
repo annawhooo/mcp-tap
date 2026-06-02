@@ -2,6 +2,28 @@
 
 Items that must be completed before publishing or presenting at a conference.
 
+## Status sweep - 2026-06-02
+
+Verified against live code (mcp_detect.py, analyze.py, log_adapter.py, score_results.py) and git history.
+
+**Done / verified**
+- Binarization pre-registration: strict is pre-registered as primary (the _detected docstring in analyze.py), with the --lenient sensitivity flag and the "Binarization mode" banner present. Pre-registered in commit d578679. Remaining work is the paper write-up (run strict as headline, lenient as appendix), not code.
+- BIO-004a (access): implemented as bio_004a_access.
+- Bug-fix history confirmed in git: BIO-004 directory-listing FP (commit 39ee276), BIO-002b tail-window FP (commit 3d33361), BIO-004a Tier 2 glob (commit 120b7e0).
+
+**Still open (verified not yet built)**
+- BIO-004b (recon), BIO-004c (exfil), BIO-004d (stealth): comments and namespace reservation only, no rule functions yet. BIO-004c still needs the --canaries CLI arg (absent).
+- BIO-010 (chemotaxis): not present in code.
+- Code uniformity sweep plus the BIO-002 to 002a/002b family rename: BIO-002b exists but there is no BIO-002a, so the rename and bundled sweep are not done.
+- CONV-005 near-dead-rule decision: conv_005_enumeration is present; the redefine-or-retire call is still pending v1 results.
+- Timestamp parser consolidation: both log_adapter._parse_timestamp and mcp_detect._parse_ts still exist; not consolidated.
+- Methodology-section framing: still to be written into the Motion Detector paper.
+
+**Deferred / future (out of scope for this paper)**
+- BIO-007 (cross-server): bio_007_cross_server_correlation exists but is inert on the single-server v1; expand to multi-server in v2.
+- Path D OS-level audit hooks.
+- Content-transformation evasion detection.
+
 ## Methods Section: Binarization Pre-Registration (PRIMARY)
 
 The 5-state outcome taxonomy (DETECTED, UNEXPECTED_FIRING, RULE_MISSED, DATA_MISSED, NOT_OBSERVABLE, NOT_EXPECTED) flows end-to-end from `score_results.py` through `aggregate_results.py` to `analyze.py`. The statistical tests (Cochran's Q, McNemar's exact) require binary outcomes, so a binarization step is unavoidable. Two specifications were considered:
@@ -145,7 +167,7 @@ Fixes worth documenting in the paper as evidence that the framework surfaced rea
 **Framework concern:** Gating.
 **Fix:** Triple-gate (direction + message_type + method) restricting rule to `tools/call` requests. Renamed BIO-004 → BIO-004a to reserve the family namespace for the recon (004b), exfil (004c), and stealth (004d) sub-rules.
 
-### BIO-002b false positive on tail-window pairs (FIXED)
+### BIO-002b false positive on tail-window pairs (FIXED, commit 3d33361)
 **Symptom:** BIO-002b fired on matched request/response pairs occurring within the tail window at log truncation.
 **Root cause originally suspected:** Lifecycle events (genesis, server_start). This was wrong — lifecycle events don't have a `direction` field and are already filtered by `filter_messages()`.
 **Actual root cause:** Asymmetric `in_tail` filtering. The tail-window filter was applied to requests only (correctly preventing BIO-002 false positives on requests whose responses hadn't arrived yet), but NOT to responses. This tore matched pairs apart: requests excluded, responses retained as "orphans" → BIO-002b false positive.
