@@ -392,6 +392,293 @@ def adapt_generic(input_path: str, output_path: str, server_id: str = "gateway")
     return len(adapted)
 
 
+# ---------------------------------------------------------------------------
+# pipelock adapter
+# ---------------------------------------------------------------------------
+#
+# pipelock (https://github.com/luckyPipewrench/pipelock) writes hash-chained
+# "recorder JSONL" evidence: one JSON object per line, each a recorder.Entry
+# wrapping a CaptureSummary in its `detail` field. Capture is verdict-oriented
+# (one entry per scanned surface), NOT a full request/response transcript, so
+# this adapter maps each capture entry to a single mcp-detect record rather
+# than synthesizing both sides of a call.
+#
+# Schema source: pipelock internal/recorder/entry.go (Entry) and
+# internal/capture/types.go (CaptureSummary, CaptureRequest, Finding).
+#   recorder.Entry keys: v, seq, ts, session_id, trace_id, type, event_kind,
+#                        transport, summary, detail, raw_ref, prev_hash, hash
+#   CaptureSummary (entry.detail) keys used: surface, subsurface, request,
+#                        raw_findings, effective_findings, effective_action,
+#                        outcome, skip_reason, agent, profile, action_class,
+#                        batch_index, config_hash, build_version, build_sha
+#   CaptureRequest keys: method, url, tool_name, tool_args_json, mcp_method,
+#                        and (once the luckyPipewrench/pipelock PR lands) rpc_id
+#
+# Mapping decisions (locked):
+#   * One capture entry -> one record. Non-"capture" entries (checkpoint,
+#     capture_drop, action_receipt, proxy_decision) are skipped.
+#   * direction/message_type by surface:
+#       request side : dlp, cee, tool_policy, url -> client_to_server / request
+#       response side: response, tool_scan        -> server_to_client / response
+#   * method   <- request.mcp_method on requests, None on responses.
+#   * params   : tool call   -> {"name": tool_name, "arguments": <parsed args>}
+#                url surface  -> {"url": request.url}
+#                otherwise    -> None
+#                responses    -> None. pipelock capture does not retain full
+#                response content (only truncated, often-redacted samples), so
+#                response-content rules cannot run against pipelock data. This
+#                is a property of verdict-oriented capture, not a bug.
+#   * message_id <- canonical rpc_id (the JSON-RPC id the pipelock PR adds),
+#     stringified via json.dumps so numeric 1 and string "1" stay distinct.
+#     Set on BOTH request and response (the server echoes the id); that is how
+#     mcp-detect pairs them. None until rpc_id ships. pipelock internal
+#     trace_id is deliberately NOT used here: it does not reliably correlate a
+#     request to its response across capture surfaces.
+#   * latency_ms : best-effort. On a response, join to the most recent prior
+#     request sharing (session_id, transport, rpc_id) and take the timestamp
+#     delta. None when either side is missing or rpc_id is absent. rpc_ids are
+#     reused within a session, so the join is qualified by session+transport
+#     and is best-effort per call, matching pipelock own guidance.
+#   * is_error : responses only. True when pipelock outcome stopped the call
+#     (blocked, fail_closed). Reflects pipelock verdict, NOT a server-side
+#     JSON-RPC error (real response content is not captured).
+#   * server_id <- CaptureSummary.agent, else profile, else the server_id arg.
+#   * hmac / prev_hmac : None. pipelock chains entries with a SHA-256 hash
+#     chain (entry.hash / entry.prev_hash), not an HMAC; those values are
+#     preserved in the _pipelock sidecar and verified separately, not folded
+#     into mcp-tap HMAC fields.
+#   * _pipelock sidecar: every record carries an optional "_pipelock" object
+#     with pipelock own verdict (surface, outcome, effective_action, raw and
+#     effective findings, etc.) plus chain fields, so analyze.py can compare
+#     mcp-detect findings against pipelock on the same traffic. mcp-detect
+#     ignores unknown keys, so the core schema is unaffected.
+
+_PIPELOCK_REQUEST_SURFACES = {"dlp", "cee", "tool_policy", "url"}
+_PIPELOCK_RESPONSE_SURFACES = {"response", "tool_scan"}
+
+
+def _ts_aware(ts):
+    """Parse a timestamp to a tz-aware UTC datetime, or None.
+
+    Wraps _parse_timestamp and promotes naive results to UTC so request and
+    response timestamps from different parse paths stay comparable.
+    """
+    dt = _parse_timestamp(ts)
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _pipelock_rpc_key(request: dict):
+    """Canonical string join key for a JSON-RPC id, or None.
+
+    pipelock stores rpc_id as the raw JSON token, so after json.loads it is an
+    int, str, or (rarely) another JSON scalar. json.dumps with sorted keys
+    gives a stable string that keeps numeric 1 distinct from string "1"
+    (1 -> "1", "1" -> the quoted form), matching pipelock byte-identical
+    join-key intent. Returns None when the id is absent or JSON null.
+    """
+    if not isinstance(request, dict) or "rpc_id" not in request:
+        return None
+    rid = request["rpc_id"]
+    if rid is None:
+        return None
+    try:
+        return json.dumps(rid, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(rid)
+
+
+def _read_pipelock_entries(input_path: str) -> list[dict]:
+    """Read pipelock recorder JSONL entries from a file or a capture directory.
+
+    If input_path is a directory, every evidence-*.jsonl beneath it is read
+    (pipelock writes one hash-chained file per session, sometimes in
+    per-session subdirectories). Each file is newline-delimited JSON; blank and
+    malformed lines are skipped. Entries are returned in file order; global
+    ordering is re-derived by timestamp in adapt_pipelock, since each file has
+    its own seq and chain and seq is not globally meaningful.
+    """
+    import os
+    import glob
+
+    if os.path.isdir(input_path):
+        paths = sorted(glob.glob(os.path.join(input_path, "**", "evidence-*.jsonl"),
+                                 recursive=True))
+    else:
+        paths = [input_path]
+
+    entries = []
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as e:
+            print(f"WARN: log_adapter: cannot read {p}: {e}", file=sys.stderr)
+    return entries
+
+
+def adapt_pipelock(input_path: str, output_path: str, server_id: str = "pipelock"):
+    """Adapt pipelock recorder JSONL evidence to mcp-detect format.
+
+    input_path may be a single evidence-*.jsonl file or a capture directory
+    (every evidence-*.jsonl beneath it is read). See the module-level comment
+    block above for the full field-by-field mapping and the rationale.
+    """
+    import bisect
+
+    raw_entries = _read_pipelock_entries(input_path)
+
+    captures = [e for e in raw_entries
+                if isinstance(e, dict) and e.get("type") == "capture"]
+
+    parsed = []
+    for idx, e in enumerate(captures):
+        detail = e.get("detail")
+        if not isinstance(detail, dict):
+            detail = {}
+        request = detail.get("request")
+        if not isinstance(request, dict):
+            request = {}
+        surface = detail.get("surface") or e.get("event_kind") or ""
+        transport = detail.get("subsurface") or e.get("transport") or ""
+        if surface in _PIPELOCK_RESPONSE_SURFACES:
+            side = "response"
+        elif surface in _PIPELOCK_REQUEST_SURFACES:
+            side = "request"
+        else:
+            side = "unknown"
+        parsed.append({
+            "entry": e,
+            "detail": detail,
+            "request": request,
+            "surface": surface,
+            "transport": transport,
+            "side": side,
+            "dt": _ts_aware(e.get("ts")),
+            "rpc_key": _pipelock_rpc_key(request),
+            "session_id": e.get("session_id"),
+            "idx": idx,
+        })
+
+    def _sort_key(p):
+        if p["dt"] is not None:
+            return (0, p["dt"], p["entry"].get("seq", 0))
+        return (1, p["idx"], 0)
+    parsed.sort(key=_sort_key)
+
+    req_index = {}
+    for p in parsed:
+        if p["side"] == "request" and p["rpc_key"] is not None and p["dt"] is not None:
+            req_index.setdefault(
+                (p["session_id"], p["transport"], p["rpc_key"]), []
+            ).append(p["dt"])
+    for key in req_index:
+        req_index[key].sort()
+
+    def _latency_for_response(p):
+        if p["rpc_key"] is None or p["dt"] is None:
+            return None
+        reqs = req_index.get((p["session_id"], p["transport"], p["rpc_key"]))
+        if not reqs:
+            return None
+        pos = bisect.bisect_right(reqs, p["dt"]) - 1
+        if pos < 0:
+            return None
+        delta_ms = (p["dt"] - reqs[pos]).total_seconds() * 1000.0
+        if delta_ms < 0:
+            return None
+        return round(delta_ms, 2)
+
+    adapted = []
+    sequence = 0
+    for p in parsed:
+        e = p["entry"]
+        detail = p["detail"]
+        request = p["request"]
+        surface = p["surface"]
+        side = p["side"]
+
+        if side == "response":
+            direction = "server_to_client"
+            message_type = "response"
+            method = None
+        elif side == "request":
+            direction = "client_to_server"
+            message_type = "request"
+            method = request.get("mcp_method")
+        else:
+            direction = "unknown"
+            message_type = "unknown"
+            method = request.get("mcp_method")
+
+        params = None
+        if side == "request":
+            tool_name = request.get("tool_name")
+            if tool_name or request.get("mcp_method") == "tools/call":
+                args = _parse_possibly_double_encoded(request.get("tool_args_json"))
+                if args is None:
+                    args = {}
+                params = {"name": tool_name, "arguments": args}
+            elif surface == "url":
+                params = {"url": request.get("url")}
+
+        server_id_val = detail.get("agent") or detail.get("profile") or server_id
+
+        sequence += 1
+        record = {
+            "timestamp": e.get("ts"),
+            "sequence": sequence,
+            "session_id": e.get("session_id"),
+            "server_id": server_id_val,
+            "direction": direction,
+            "method": method,
+            "params": params,
+            "message_id": p["rpc_key"],
+            "message_type": message_type,
+            "latency_ms": _latency_for_response(p) if side == "response" else None,
+            "hmac": None,
+            "prev_hmac": None,
+        }
+        if side == "response":
+            record["is_error"] = detail.get("outcome") in ("blocked", "fail_closed")
+
+        record["_pipelock"] = {
+            "surface": surface,
+            "subsurface": p["transport"],
+            "trace_id": e.get("trace_id"),
+            "seq": e.get("seq"),
+            "prev_hash": e.get("prev_hash"),
+            "hash": e.get("hash"),
+            "outcome": detail.get("outcome"),
+            "effective_action": detail.get("effective_action"),
+            "raw_findings": detail.get("raw_findings"),
+            "effective_findings": detail.get("effective_findings"),
+            "skip_reason": detail.get("skip_reason"),
+            "action_class": detail.get("action_class"),
+            "agent": detail.get("agent"),
+            "profile": detail.get("profile"),
+            "batch_index": detail.get("batch_index"),
+            "config_hash": detail.get("config_hash"),
+            "build_version": detail.get("build_version"),
+            "build_sha": detail.get("build_sha"),
+        }
+
+        adapted.append(record)
+
+    _write_output(adapted, output_path)
+    return len(adapted)
+
+
 def passthrough(input_path: str, output_path: str, **kwargs):
     """mcp-tap format: just copy (already in the right format)."""
     import shutil
@@ -440,6 +727,7 @@ ADAPTERS = {
     "bifrost": adapt_bifrost,
     "bifrost-json": adapt_bifrost_json,
     "generic": adapt_generic,
+    "pipelock": adapt_pipelock,
 }
 
 
