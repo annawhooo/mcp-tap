@@ -116,9 +116,26 @@ def _is_jsonrpc_error_response(m: dict) -> bool:
     return isinstance(p.get("code"), int) and isinstance(p.get("message"), str)
 
 
+def _is_failed_operation(m: dict) -> bool:
+    """
+    True iff m represents a failed operation, covering BOTH:
+      - JSON-RPC protocol errors (see _is_jsonrpc_error_response), and
+      - MCP tool-level failures returned as a successful JSON-RPC response
+        whose result carries isError=true.
+    MCP servers report tool failures via result.isError rather than a
+    JSON-RPC error object, so protocol-only checks miss them.
+    """
+    if _is_jsonrpc_error_response(m):
+        return True
+    if m.get("message_type") != "response":
+        return False
+    p = m.get("params")
+    return isinstance(p, dict) and p.get("isError") is True
+
+
 def conv_001_failed_auth(messages: list[dict]) -> list[Finding]:
     """CONV-001: Failed authentication/operation attempts."""
-    failures = [m for m in messages if _is_jsonrpc_error_response(m)]
+    failures = [m for m in messages if _is_failed_operation(m)]
     if len(failures) < 3:
         return []
     return [Finding(
@@ -186,26 +203,47 @@ def conv_003_rapid_tool_calls(messages: list[dict]) -> list[Finding]:
 def conv_004_credential_scope(messages: list[dict]) -> list[Finding]:
     """CONV-004: Credential used outside defined scope."""
     findings = []
-    # Look for tool calls with URL parameters that don't match the server
+    # HTTP endpoint patterns apply to url args; filesystem scope patterns
+    # apply to path-like args. Kept separate so a filename such as
+    # 'admin_credentials_backup.txt' does not collide with the '/admin'
+    # HTTP pattern.
+    url_patterns = ["/admin", "/internal", "/.env", "/etc/passwd",
+                    "/user/emails", "/v1/balance"]
+    fs_patterns = ["..", "system32", "/etc/passwd", "\\windows\\"]
+    path_arg_keys = ("path", "source", "destination")
     tool_calls = [m for m in messages if m.get("method") == "tools/call"]
     for tc in tool_calls:
         params = tc.get("params", {})
-        if isinstance(params, dict):
-            args = params.get("arguments", {})
-            if isinstance(args, dict):
-                url = args.get("url", "")
-                # Flag any URL that looks like it's hitting an internal/sensitive endpoint
-                sensitive_patterns = ["/admin", "/internal", "/.env", "/etc/passwd",
-                                      "/user/emails", "/v1/balance"]
-                for pattern in sensitive_patterns:
-                    if pattern in str(url).lower():
-                        findings.append(Finding(
-                            rule_id="CONV-004",
-                            rule_set="conventional",
-                            severity="HIGH",
-                            description=f"Sensitive endpoint access: {pattern}",
-                            evidence=[tc],
-                        ))
+        if not isinstance(params, dict):
+            continue
+        args = params.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        checks = []
+        u = args.get("url")
+        if isinstance(u, str):
+            checks.append((u, url_patterns))
+        for k in path_arg_keys:
+            v = args.get(k)
+            if isinstance(v, str):
+                checks.append((v, fs_patterns))
+        plist = args.get("paths")
+        if isinstance(plist, list):
+            for p in plist:
+                if isinstance(p, str):
+                    checks.append((p, fs_patterns))
+        for val, pats in checks:
+            low = val.lower()
+            for pattern in pats:
+                if pattern in low:
+                    findings.append(Finding(
+                        rule_id="CONV-004",
+                        rule_set="conventional",
+                        severity="HIGH",
+                        description=f"Out-of-scope access: '{pattern}' in {val[:60]}",
+                        evidence=[tc],
+                    ))
+                    break
     return findings
 
 
@@ -398,6 +436,34 @@ def bio_003_behavioral_baseline_deviation(messages: list[dict],
                 names.append(p.get("name", "unknown"))
         return Counter(names)
 
+    def access_zones(calls):
+        # Directory components traversed across path-like args. The final
+        # path segment (filename, or a directory passed as the leaf) is
+        # excluded so the signal is zone/directory novelty (e.g. entering a
+        # 'privileged' subtree) rather than per-file novelty, which would
+        # fire on almost any session that touches different files.
+        zones = set()
+        for c in calls:
+            p = c.get("params", {})
+            if not isinstance(p, dict):
+                continue
+            args = p.get("arguments", {})
+            if not isinstance(args, dict):
+                continue
+            vals = []
+            for k in ("path", "source", "destination"):
+                v = args.get(k)
+                if isinstance(v, str):
+                    vals.append(v)
+            pl = args.get("paths")
+            if isinstance(pl, list):
+                vals.extend([x for x in pl if isinstance(x, str)])
+            for v in vals:
+                parts = [seg for seg in re.split(r"[\\/]+", v) if seg]
+                for seg in parts[:-1]:  # exclude final segment
+                    zones.add(seg.lower())
+        return zones
+
     if baseline_messages is not None:
         # Compare current session against provided baseline
         baseline_calls = [m for m in baseline_messages
@@ -407,6 +473,9 @@ def bio_003_behavioral_baseline_deviation(messages: list[dict],
             return findings
         dist_baseline = tool_names(baseline_calls)
         dist_current = tool_names(tool_calls)
+        zones_baseline = access_zones(baseline_calls)
+        zones_current = access_zones(tool_calls)
+        source = "baseline"
     else:
         # Fallback: compare first half vs second half (naive)
         if len(tool_calls) < 6:
@@ -414,17 +483,24 @@ def bio_003_behavioral_baseline_deviation(messages: list[dict],
         mid = len(tool_calls) // 2
         dist_baseline = tool_names(tool_calls[:mid])
         dist_current = tool_names(tool_calls[mid:])
+        zones_baseline = access_zones(tool_calls[:mid])
+        zones_current = access_zones(tool_calls[mid:])
+        source = "first half"
 
-    # Check for tools that appear in current but not in baseline
+    # Deviation = a tool name OR a directory zone present in current but not baseline.
     new_tools = set(dist_current.keys()) - set(dist_baseline.keys())
-    if new_tools:
-        source = "baseline" if baseline_messages is not None else "first half"
+    new_zones = zones_current - zones_baseline
+    if new_tools or new_zones:
+        bits = []
+        if new_tools:
+            bits.append(f"new tools {new_tools}")
+        if new_zones:
+            bits.append(f"new access zones {new_zones}")
         findings.append(Finding(
             rule_id="BIO-003",
             rule_set="bio-derived",
             severity="MEDIUM",
-            description=f"New tool usage not in {source}: {new_tools}. "
-                        f"{source.capitalize()} used: {set(dist_baseline.keys())}",
+            description=f"Behavioral deviation vs {source}: " + "; ".join(bits),
             evidence=tool_calls[-3:],
             scenario="#2 Behavioral Camouflage",
         ))
@@ -610,6 +686,11 @@ def _glob_to_regex(pattern: str) -> "re.Pattern":
     return re.compile("^" + "".join(out) + "$", re.IGNORECASE)
 
 
+BIO_005_MIN_CALLS = 4                # need an established cadence before judging silence
+BIO_005_SILENCE_FLOOR_SECONDS = 5.0  # ignore gaps below this absolute floor
+BIO_005_GAP_MULTIPLIER = 4.0         # a gap this many x the median cadence is anomalous
+
+
 def bio_005_silence_detection(messages: list[dict]) -> list[Finding]:
     """
     BIO-005: Silence-based alerting (privileged zone monitoring).
@@ -619,27 +700,44 @@ def bio_005_silence_detection(messages: list[dict]) -> list[Finding]:
     tool call responses over a time window, something is wrong. The
     privileged zone is being accessed but producing no observable output.
     """
+    # NOTE (2026-06-08 audit, R4): repurposed from dark-server detection
+    # (requests>3 & responses==0), which was a strict subset of BIO-002's
+    # orphan-request branch and fired on no scenario, to TEMPORAL silence:
+    # a monitoring cadence drop after an established burst (telemetry
+    # suppression, scenario #1). The fully-dark case stays covered by
+    # BIO-002. Docstring reconciliation deferred to the D1 final pass.
     findings = []
-    by_server = defaultdict(lambda: {"requests": 0, "responses": 0})
-
+    tool_ts = []
     for m in messages:
-        sid = m.get("server_id", "unknown")
-        if m.get("direction") == "client_to_server":
-            by_server[sid]["requests"] += 1
-        elif m.get("direction") == "server_to_client":
-            by_server[sid]["responses"] += 1
-
-    for sid, counts in by_server.items():
-        if counts["requests"] > 3 and counts["responses"] == 0:
-            findings.append(Finding(
-                rule_id="BIO-005",
-                rule_set="bio-derived",
-                severity="HIGH",
-                description=f"Server '{sid}' received {counts['requests']} requests "
-                            f"but produced 0 responses (silence in monitored zone)",
-                evidence=[],
-                scenario="#6 Privileged Zone Exploitation",
-            ))
+        if (m.get("direction") == "client_to_server"
+                and m.get("method") == "tools/call"):
+            t = _parse_ts(m.get("timestamp", ""))
+            if t is not None:
+                tool_ts.append(t)
+    if len(tool_ts) < BIO_005_MIN_CALLS:
+        return findings
+    tool_ts.sort()
+    gaps = [(tool_ts[i + 1] - tool_ts[i]).total_seconds()
+            for i in range(len(tool_ts) - 1)]
+    if not gaps:
+        return findings
+    sg = sorted(gaps)
+    n = len(sg)
+    median_gap = sg[n // 2] if n % 2 else (sg[n // 2 - 1] + sg[n // 2]) / 2
+    max_gap = max(gaps)
+    if (median_gap > 0
+            and max_gap >= BIO_005_SILENCE_FLOOR_SECONDS
+            and max_gap > BIO_005_GAP_MULTIPLIER * median_gap):
+        findings.append(Finding(
+            rule_id="BIO-005",
+            rule_set="bio-derived",
+            severity="HIGH",
+            description=f"Monitoring cadence drop: {max_gap:.1f}s gap vs "
+                        f"{median_gap:.1f}s median across {len(tool_ts)} tool calls "
+                        f"(possible telemetry suppression)",
+            evidence=[],
+            scenario="#1 Telemetry Suppression",
+        ))
     return findings
 
 
